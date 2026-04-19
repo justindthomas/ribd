@@ -1,0 +1,12 @@
+[package]
+name = "ribd-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Wire protocol types for the ribd RIB daemon"
+license = "LGPL-3.0-or-later"
+authors = ["Justin Thomas"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+thiserror = "1"

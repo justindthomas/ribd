@@ -1,0 +1,13 @@
+[package]
+name = "ribd-client"
+version = "0.1.0"
+edition = "2021"
+description = "Tokio-based client library for producers pushing routes to ribd"
+license = "LGPL-3.0-or-later"
+authors = ["Justin Thomas"]
+
+[dependencies]
+ribd-proto = { path = "../ribd-proto" }
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "macros", "rt"] }
+tracing = "0.1"
+thiserror = "1"

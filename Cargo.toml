@@ -1,0 +1,15 @@
+[workspace]
+members = ["ribd", "ribd-proto", "ribd-client"]
+resolver = "2"
+
+[profile.release]
+lto = true
+strip = true
+
+# Local development override: if vpp-api is checked out alongside
+# this workspace (../vpp-api), use it in place of the git source
+# declared by the `ribd` member crate. Harmless to anyone cloning
+# just this repo — Cargo only consults `[patch]` entries whose
+# paths resolve locally.
+[patch."https://github.com/justindthomas/vpp-api"]
+vpp-api = { path = "../vpp-api" }

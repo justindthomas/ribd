@@ -1,0 +1,37 @@
+[package]
+name = "ribd"
+version = "0.1.0"
+edition = "2021"
+description = "Central RIB daemon — arbitrates routes from OSPF/BGP/DHCP and programs VPP FIB + Linux kernel"
+license = "AGPL-3.0-or-later"
+authors = ["Justin Thomas"]
+
+[[bin]]
+name = "ribd"
+path = "src/main.rs"
+
+[dependencies]
+ribd-proto = { path = "../ribd-proto" }
+vpp-api = { git = "https://github.com/justindthomas/vpp-api" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+futures = "0.3"
+
+# Netlink is Linux-only. On BSD (the freebsd experiment) the kernel_backend
+# module compiles to a no-op stub and these deps aren't needed.
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.14"
+netlink-packet-route = "0.19"
+
+[dev-dependencies]
+ribd-client = { path = "../ribd-client" }
+tempfile = "3"
+libc = "0.2"
+futures = "0.3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rtnetlink = "0.14"
+netlink-packet-route = "0.19"

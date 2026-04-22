@@ -33,6 +33,12 @@ pub struct RouterConfig {
     pub interfaces: Vec<Interface>,
     #[serde(default)]
     pub routes: Vec<StaticRoute>,
+    #[serde(default)]
+    pub loopbacks: Vec<Loopback>,
+    #[serde(default)]
+    pub bvi_domains: Vec<BviDomain>,
+    #[serde(default)]
+    pub tunnels: Vec<Tunnel>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +78,49 @@ pub struct StaticRoute {
     pub via: String,
     #[serde(default)]
     pub interface: Option<String>,
+}
+
+/// Loopback interface yaml shape. Minimal — only the fields needed
+/// to emit a connected route. VPP names these `loop<instance>`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Loopback {
+    pub instance: u32,
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv4_prefix: Option<u8>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub ipv6_prefix: Option<u8>,
+}
+
+/// BVI yaml shape. VPP names these `bvi<bridge_id>`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BviDomain {
+    pub bridge_id: u32,
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv4_prefix: Option<u8>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub ipv6_prefix: Option<u8>,
+}
+
+/// GRE tunnel yaml shape. VPP names these `gre<instance>`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Tunnel {
+    pub name: String,
+    #[serde(default)]
+    pub tunnel_ipv4: Option<String>,
+    #[serde(default)]
+    pub tunnel_ipv4_prefix: Option<u8>,
+    #[serde(default)]
+    pub tunnel_ipv6: Option<String>,
+    #[serde(default)]
+    pub tunnel_ipv6_prefix: Option<u8>,
 }
 
 /// Load `/persistent/config/router.yaml` (or `path`). Returns an

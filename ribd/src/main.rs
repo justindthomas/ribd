@@ -408,6 +408,78 @@ async fn build_config_connected(
             }
         }
     }
+
+    // Loopbacks: VPP names them loop<instance>. impd's render emits
+    // `create loopback interface instance N` + `set interface ip
+    // address loopN <addr>/<prefix>` in commands-core.txt.
+    for lo in &cfg.loopbacks {
+        let name = format!("loop{}", lo.instance);
+        let Some(idx) = resolve_iface_index(vpp, &name).await else {
+            tracing::debug!(
+                iface = %name,
+                "config connected: loopback sw_if_index miss",
+            );
+            continue;
+        };
+        if let (Some(addr), Some(prefix)) = (&lo.ipv4, lo.ipv4_prefix) {
+            if let Some(r) = build_connected_v4(addr, prefix, idx) {
+                out.push(r);
+            }
+        }
+        if let (Some(addr), Some(prefix)) = (&lo.ipv6, lo.ipv6_prefix) {
+            if let Some(r) = build_connected_v6(addr, prefix, idx) {
+                out.push(r);
+            }
+        }
+    }
+
+    // BVIs: VPP names them bvi<bridge_id>. Same template pattern as
+    // loopbacks (the BVI is a loopback member-of bridge-domain).
+    // Without this, BGP redistribute-connected misses the LAN-side
+    // prefix and the router stops announcing internal subnets.
+    for bvi in &cfg.bvi_domains {
+        let name = format!("bvi{}", bvi.bridge_id);
+        let Some(idx) = resolve_iface_index(vpp, &name).await else {
+            tracing::debug!(
+                iface = %name,
+                "config connected: bvi sw_if_index miss",
+            );
+            continue;
+        };
+        if let (Some(addr), Some(prefix)) = (&bvi.ipv4, bvi.ipv4_prefix) {
+            if let Some(r) = build_connected_v4(addr, prefix, idx) {
+                out.push(r);
+            }
+        }
+        if let (Some(addr), Some(prefix)) = (&bvi.ipv6, bvi.ipv6_prefix) {
+            if let Some(r) = build_connected_v6(addr, prefix, idx) {
+                out.push(r);
+            }
+        }
+    }
+
+    // GRE tunnels: VPP names these by the user-chosen name from the
+    // config. Each exposes a p2p /32 (or /128) on its tunnel address.
+    for tun in &cfg.tunnels {
+        let Some(idx) = resolve_iface_index(vpp, &tun.name).await else {
+            tracing::debug!(
+                iface = %tun.name,
+                "config connected: tunnel sw_if_index miss",
+            );
+            continue;
+        };
+        if let (Some(addr), Some(prefix)) = (&tun.tunnel_ipv4, tun.tunnel_ipv4_prefix) {
+            if let Some(r) = build_connected_v4(addr, prefix, idx) {
+                out.push(r);
+            }
+        }
+        if let (Some(addr), Some(prefix)) = (&tun.tunnel_ipv6, tun.tunnel_ipv6_prefix) {
+            if let Some(r) = build_connected_v6(addr, prefix, idx) {
+                out.push(r);
+            }
+        }
+    }
+
     out
 }
 

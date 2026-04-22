@@ -19,6 +19,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+ipnet = "2"
 
 # Netlink is Linux-only. On BSD (the freebsd experiment) the kernel_backend
 # module compiles to a no-op stub and these deps aren't needed.

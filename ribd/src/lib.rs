@@ -5,6 +5,7 @@
 //! via the Unix socket at `/run/ribd.sock`; ribd arbitrates
 //! across sources by admin distance and installs the winner.
 
+pub mod config;
 #[cfg(target_os = "linux")]
 pub mod kernel_backend;
 #[cfg(not(target_os = "linux"))]

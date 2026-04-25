@@ -13,6 +13,7 @@
 //! immediate expiry is simpler and matches the single-producer case.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ribd_proto::{
@@ -37,6 +38,13 @@ pub struct SharedState {
     /// Cached local interface address set used to filter self-routes
     /// (next-hop = one of our own IPs). See `local_addrs.rs`.
     pub local_addrs: Mutex<LocalAddrs>,
+    /// Counter incremented after every successful reconcile_from_config
+    /// (initial seed + each SIGHUP). Exposed via QueryRequest::ReadyState
+    /// so impd can sequence its boot SIGHUP fanout: read pre-value,
+    /// signal ribd, poll until the value increases, then signal the
+    /// remaining children (bgpd/ospfd/dhcpd) which query connected
+    /// routes from a now-reconciled RIB.
+    pub reconcile_generation: AtomicU64,
 }
 
 /// Returns true if `route` looks like a self-route — i.e. *every*
@@ -359,12 +367,18 @@ async fn handle_message(
             ServerMsg::Ok
         }
         ClientMsg::Query(req) => {
-            let rib = state.rib.lock().await;
             let reply = match req {
                 QueryRequest::InstalledRoutes => {
+                    let rib = state.rib.lock().await;
                     QueryReply::InstalledRoutes(rib.installed_routes())
                 }
-                QueryRequest::AllCandidates => QueryReply::AllCandidates(rib.all_candidates()),
+                QueryRequest::AllCandidates => {
+                    let rib = state.rib.lock().await;
+                    QueryReply::AllCandidates(rib.all_candidates())
+                }
+                QueryRequest::ReadyState => QueryReply::ReadyState {
+                    reconcile_generation: state.reconcile_generation.load(Ordering::SeqCst),
+                },
             };
             ServerMsg::QueryReply(reply)
         }

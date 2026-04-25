@@ -238,6 +238,12 @@ pub enum QueryRequest {
     /// All candidates, grouped by prefix. Includes losing candidates
     /// so operators can see why a route was (or wasn't) chosen.
     AllCandidates,
+    /// Lightweight readiness probe. Returns a counter that increments
+    /// after every successful reconcile_from_config (initial seed +
+    /// each SIGHUP). Clients sequencing against ribd's reconcile use
+    /// it to wait until a fresh reconcile has actually completed,
+    /// rather than racing the kernel-level "socket appeared" signal.
+    ReadyState,
 }
 
 /// Provenance for a route that was installed via recursive
@@ -299,6 +305,13 @@ pub struct PrefixCandidates {
 pub enum QueryReply {
     InstalledRoutes(Vec<InstalledRoute>),
     AllCandidates(Vec<PrefixCandidates>),
+    /// Reply to `QueryRequest::ReadyState`. `reconcile_generation`
+    /// starts at 0 before the initial reconcile completes, becomes 1
+    /// after the first reconcile, and increments by 1 on every
+    /// subsequent reconcile (e.g. each SIGHUP). Clients capture the
+    /// value before signalling and poll until they observe a higher
+    /// value to know their signal has been processed.
+    ReadyState { reconcile_generation: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

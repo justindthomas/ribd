@@ -5,6 +5,7 @@
 //! One tokio task per client.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -164,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         kernel,
         vpp,
         local_addrs,
+        reconcile_generation: AtomicU64::new(0),
     });
 
     let cfg = ribd_config::load(&args.config_path);
@@ -696,4 +698,10 @@ async fn reconcile_from_config(
     if let Some(kernel) = &state.kernel {
         kernel.apply(&connected_deltas).await;
     }
+
+    // Bump the reconcile generation so impd's boot SIGHUP path can
+    // observe that this reconcile finished and proceed to SIGHUP
+    // bgpd/ospfd/dhcpd. See QueryRequest::ReadyState in ribd-proto.
+    let gen = state.reconcile_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    tracing::info!(reconcile_generation = gen, "reconcile complete");
 }

@@ -140,6 +140,11 @@ async fn handle_one_session(stream: tokio::net::UnixStream, rib: Arc<Mutex<Rib>>
                 let g = rib.lock().await;
                 ServerMsg::QueryReply(QueryReply::AllCandidates(g.all_candidates()))
             }
+            ClientMsg::Query(QueryRequest::ReadyState) => ServerMsg::QueryReply(
+                QueryReply::ReadyState {
+                    reconcile_generation: 0,
+                },
+            ),
             ClientMsg::Heartbeat => ServerMsg::Ok,
         };
 

@@ -152,6 +152,9 @@ async fn session_protocol_roundtrip() {
                         QueryRequest::AllCandidates => {
                             QueryReply::AllCandidates(rib.all_candidates())
                         }
+                        QueryRequest::ReadyState => QueryReply::ReadyState {
+                            reconcile_generation: 0,
+                        },
                     };
                     ServerMsg::QueryReply(reply)
                 }

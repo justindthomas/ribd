@@ -68,7 +68,12 @@ fn parse_args() -> Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Honour NO_COLOR (no-color.org) so the supervisor doesn't see
+    // ANSI escapes in captured stderr → journald. tracing_subscriber
+    // auto-detects TTY by default but the detection has been spotty
+    // across versions, so opt out explicitly when the env is set.
     tracing_subscriber::fmt()
+        .with_ansi(std::env::var_os("NO_COLOR").is_none())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ribd=info")),

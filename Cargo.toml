@@ -1,5 +1,5 @@
 [workspace]
-members = ["ribd", "ribd-proto", "ribd-client"]
+members = ["ribd", "ribd-proto", "ribd-client", "ribd-routemap"]
 resolver = "2"
 
 [profile.release]

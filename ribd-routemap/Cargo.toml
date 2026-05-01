@@ -1,0 +1,16 @@
+[package]
+name = "ribd-routemap"
+version = "0.1.0"
+edition = "2021"
+description = "Shared route-map schema and evaluator for routing daemons that speak to ribd"
+license = "LGPL-3.0-or-later"
+authors = ["Justin Thomas"]
+
+[dependencies]
+ribd-proto = { path = "../ribd-proto" }
+serde = { version = "1", features = ["derive"] }
+ipnet = { version = "2", features = ["serde"] }
+thiserror = "1"
+
+[dev-dependencies]
+serde_yaml = "0.9"

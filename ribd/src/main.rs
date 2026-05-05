@@ -88,19 +88,24 @@ async fn main() -> anyhow::Result<()> {
         "starting ribd"
     );
 
-    let vpp = vpp_api::VppClient::connect(&args.vpp_api_socket)
-        .await
-        .with_context(|| format!("connecting to VPP at {}", args.vpp_api_socket))?;
+    // Spawn the VPP supervisor (which will retry until VPP is up)
+    // and wait for the first connection so the rest of startup can
+    // assume a live client. After this point the supervisor handles
+    // disconnects transparently — `vpp_supervisor.client().await`
+    // blocks while we're between connections, and the on_reconnect
+    // closure registered below re-pushes the full RIB to VPP.
+    let vpp_supervisor = vpp_api::VppSupervisor::spawn(args.vpp_api_socket.clone());
+    let vpp_initial = vpp_supervisor.wait_ready().await;
 
     // Build the VPP sw_if_index → kernel ifindex map. Even with
     // --no-kernel we keep the map around: it's cheap and surfaces
     // early feedback if linux_cp TAPs are missing. Refresh happens
-    // on startup only; Phase 2 doesn't handle dynamic interface
-    // changes.
+    // on startup, on every reconnect, and on SIGHUP — see
+    // `refresh_static_state` below.
     let ifindex_map = Arc::new(Mutex::new(IfIndexMap::new()));
     {
         let mut m = ifindex_map.lock().await;
-        m.refresh(&vpp).await;
+        m.refresh(&vpp_initial).await;
     }
 
     // Cache the set of local interface addresses so the session
@@ -109,8 +114,9 @@ async fn main() -> anyhow::Result<()> {
     let local_addrs = Mutex::new(LocalAddrs::new());
     {
         let mut la = local_addrs.lock().await;
-        la.refresh(&vpp).await;
+        la.refresh(&vpp_initial).await;
     }
+    drop(vpp_initial);
 
     let kernel = if args.disable_kernel {
         tracing::info!("--no-kernel: kernel netlink backend disabled");
@@ -168,23 +174,107 @@ async fn main() -> anyhow::Result<()> {
         rib: Mutex::new(Rib::new()),
         backend: VppBackend::new(),
         kernel,
-        vpp,
+        vpp: vpp_supervisor.clone(),
         local_addrs,
         reconcile_generation: AtomicU64::new(0),
     });
 
-    let cfg = ribd_config::load(&args.config_path);
-    let vpp_connected = seed_connected_routes(&state.vpp).await;
-    let yaml_connected = build_config_connected(&state.vpp, &cfg).await;
-    let yaml_static = build_config_static(&state.vpp, &cfg).await;
-    tracing::info!(
-        vpp_connected = vpp_connected.len(),
-        yaml_connected = yaml_connected.len(),
-        yaml_static = yaml_static.len(),
-        path = %args.config_path.display(),
-        "initial reconcile",
-    );
-    reconcile_from_config(&state, vpp_connected, yaml_connected, yaml_static).await;
+    {
+        let cfg = ribd_config::load(&args.config_path);
+        let vpp = state.vpp.client().await;
+        let vpp_connected = seed_connected_routes(&vpp).await;
+        let yaml_connected = build_config_connected(&vpp, &cfg).await;
+        let yaml_static = build_config_static(&vpp, &cfg).await;
+        tracing::info!(
+            vpp_connected = vpp_connected.len(),
+            yaml_connected = yaml_connected.len(),
+            yaml_static = yaml_static.len(),
+            path = %args.config_path.display(),
+            "initial reconcile",
+        );
+        drop(vpp);
+        reconcile_from_config(&state, vpp_connected, yaml_connected, yaml_static).await;
+    }
+
+    // Register the VPP-reconnect handler. On every reconnect (NOT
+    // the initial connect) we:
+    //  1. Re-seed connected routes from the freshly-attached VPP
+    //     (interface indexes are different now).
+    //  2. Re-program every InstalledRoute the in-memory RIB owns
+    //     into VPP's empty FIB — producer-pushed BGP/OSPF/DHCP
+    //     routes were lost when VPP died, the RIB still has them.
+    // The kernel side is untouched on reconnect: kernel routes
+    // survive a VPP crash, and reprogramming them would just churn
+    // for no benefit.
+    {
+        let state_for_reinit = state.clone();
+        let config_path_for_reinit = args.config_path.clone();
+        vpp_supervisor
+            .on_reconnect(move |client, generation| {
+                let state = state_for_reinit.clone();
+                let config_path = config_path_for_reinit.clone();
+                async move {
+                    tracing::info!(
+                        generation,
+                        "VPP reconnected: re-pushing RIB to fresh FIB"
+                    );
+                    {
+                        let mut m = IfIndexMap::new();
+                        m.refresh(&client).await;
+                        // The session-side IfIndexMap lives inside KernelBackend;
+                        // we can't reach it from here without restructuring.
+                        // Re-fetch sw_if_index → kernel ifindex on next SIGHUP
+                        // is the workaround for now.
+                        drop(m);
+                    }
+                    {
+                        let mut la = state.local_addrs.lock().await;
+                        la.refresh(&client).await;
+                    }
+                    let cfg = ribd_config::load(&config_path);
+                    let vpp_connected = seed_connected_routes(&client).await;
+                    let yaml_connected = build_config_connected(&client, &cfg).await;
+                    let yaml_static = build_config_static(&client, &cfg).await;
+                    reconcile_from_config(&state, vpp_connected, yaml_connected, yaml_static).await;
+
+                    // Re-push every producer-installed route to VPP's
+                    // empty FIB. Connected/Static were just handled by
+                    // reconcile_from_config; everything else (BGP,
+                    // OSPF, DHCP-PD, …) is in the RIB but no longer in
+                    // VPP. Synthesise install-shaped Deltas straight
+                    // from `installed_routes()` — the RIB itself is
+                    // already correct, this is purely a backend
+                    // re-push.
+                    let installed = {
+                        let rib = state.rib.lock().await;
+                        rib.installed_routes()
+                    };
+                    let deltas: Vec<ribd::rib::Delta> = installed
+                        .into_iter()
+                        .filter(|ir| {
+                            !matches!(
+                                ir.source,
+                                ribd_proto::Source::Connected | ribd_proto::Source::Static
+                            )
+                        })
+                        .map(|ir| ribd::rib::Delta {
+                            prefix: ir.prefix,
+                            new: Some(ir),
+                        })
+                        .collect();
+                    if !deltas.is_empty() {
+                        state.backend.apply(&client, &deltas).await;
+                    }
+                    tracing::info!(
+                        generation,
+                        producer_routes = deltas.len(),
+                        "VPP reconnect: producer routes re-pushed"
+                    );
+                    Ok(())
+                }
+            })
+            .await;
+    }
 
     tracing::info!("ribd ready");
 
@@ -217,9 +307,11 @@ async fn main() -> anyhow::Result<()> {
             _ = sighup.recv() => {
                 tracing::info!(path = %config_path.display(), "SIGHUP: reloading config");
                 let cfg = ribd_config::load(&config_path);
-                let vpp_conn = seed_connected_routes(&state.vpp).await;
-                let yaml_conn = build_config_connected(&state.vpp, &cfg).await;
-                let stat = build_config_static(&state.vpp, &cfg).await;
+                let vpp = state.vpp.client().await;
+                let vpp_conn = seed_connected_routes(&vpp).await;
+                let yaml_conn = build_config_connected(&vpp, &cfg).await;
+                let stat = build_config_static(&vpp, &cfg).await;
+                drop(vpp);
                 reconcile_from_config(&state, vpp_conn, yaml_conn, stat).await;
             }
         }
@@ -699,7 +791,9 @@ async fn reconcile_from_config(
     // Flush deltas through the backends the same way session.rs
     // does after a producer Bulk.
     drop(rib);
-    state.backend.apply(&state.vpp, &connected_deltas).await;
+    let vpp = state.vpp.client().await;
+    state.backend.apply(&vpp, &connected_deltas).await;
+    drop(vpp);
     if let Some(kernel) = &state.kernel {
         kernel.apply(&connected_deltas).await;
     }

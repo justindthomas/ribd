@@ -34,7 +34,11 @@ pub struct SharedState {
     pub rib: Mutex<Rib>,
     pub backend: VppBackend,
     pub kernel: Option<KernelBackend>,
-    pub vpp: vpp_api::VppClient,
+    /// Connection supervisor for VPP — survives VPP crashes/restarts.
+    /// Each apply path obtains a live client via `vpp.client().await`
+    /// (waits if currently disconnected). On reconnect a registered
+    /// closure re-pushes the full RIB to VPP's empty FIB; see main.rs.
+    pub vpp: vpp_api::VppSupervisor,
     /// Cached local interface address set used to filter self-routes
     /// (next-hop = one of our own IPs). See `local_addrs.rs`.
     pub local_addrs: Mutex<LocalAddrs>,
@@ -65,7 +69,12 @@ impl SharedState {
         if deltas.is_empty() {
             return;
         }
-        self.backend.apply(&self.vpp, deltas).await;
+        // Wait for a live VPP connection. While VPP is restarting,
+        // producer pushes block here rather than silently dropping
+        // FIB programming — the alternative is the FIB drifting
+        // permanently out of sync with the in-memory RIB.
+        let vpp = self.vpp.client().await;
+        self.backend.apply(&vpp, deltas).await;
         if let Some(k) = &self.kernel {
             k.apply(deltas).await;
         }

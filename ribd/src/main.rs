@@ -258,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
                             )
                         })
                         .map(|ir| ribd::rib::Delta {
+                            table_id: ir.table_id,
                             prefix: ir.prefix,
                             new: Some(ir),
                         })
@@ -331,8 +332,32 @@ async fn main() -> anyhow::Result<()> {
 /// upstream peer's connected address gets held forever because
 /// ribd's LPM resolver finds no covering prefix.
 async fn seed_connected_routes(vpp: &vpp_api::VppClient) -> Vec<ribd_proto::Route> {
-    use vpp_api::generated::interface::{SwInterfaceDetails, SwInterfaceDump};
+    use vpp_api::generated::interface::{
+        SwInterfaceDetails, SwInterfaceDump, SwInterfaceGetTable, SwInterfaceGetTableReply,
+    };
     use vpp_api::generated::ip::{IpAddressDetails, IpAddressDump};
+
+    // Helper: query the v4 or v6 FIB-id assigned to an interface.
+    // Returns 0 (the default VRF) on error so a probe failure
+    // doesn't drop the connected-route seed entirely — at worst
+    // the route lands in the wrong table, which is the same
+    // behaviour as before this enhancement.
+    async fn interface_fib_id(
+        vpp: &vpp_api::VppClient,
+        sw_if_index: u32,
+        is_ipv6: bool,
+    ) -> u32 {
+        match vpp
+            .request::<SwInterfaceGetTable, SwInterfaceGetTableReply>(SwInterfaceGetTable {
+                sw_if_index,
+                is_ipv6,
+            })
+            .await
+        {
+            Ok(r) if r.retval == 0 => r.vrf_id,
+            _ => 0,
+        }
+    }
 
     let mut out = Vec::new();
     let ifaces: Vec<SwInterfaceDetails> = match vpp
@@ -350,6 +375,11 @@ async fn seed_connected_routes(vpp: &vpp_api::VppClient) -> Vec<ribd_proto::Rout
         if !vi.flags.is_admin_up() {
             continue;
         }
+        // Look up this interface's FIB-id once per AF. Defaults
+        // to 0 (the default VRF) on error.
+        let v4_table = interface_fib_id(vpp, vi.sw_if_index, false).await;
+        let v6_table = interface_fib_id(vpp, vi.sw_if_index, true).await;
+
         // v4 addresses
         let v4 = vpp
             .dump::<IpAddressDump, IpAddressDetails>(IpAddressDump {
@@ -382,6 +412,7 @@ async fn seed_connected_routes(vpp: &vpp_api::VppClient) -> Vec<ribd_proto::Rout
                 metric: 0,
                 tag: 0,
                 admin_distance: None,
+                table_id: v4_table,
             });
         }
         // v6 addresses
@@ -413,6 +444,7 @@ async fn seed_connected_routes(vpp: &vpp_api::VppClient) -> Vec<ribd_proto::Rout
                 metric: 0,
                 tag: 0,
                 admin_distance: None,
+                table_id: v6_table,
             });
         }
     }
@@ -688,6 +720,7 @@ async fn build_config_static(
             metric: 0,
             tag: 0,
             admin_distance: None,
+            table_id: 0,
         });
     }
     out
@@ -716,6 +749,7 @@ fn build_connected_v4(address: &str, prefix: u8, sw_if_index: u32) -> Option<rib
         metric: 0,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     })
 }
 
@@ -740,6 +774,7 @@ fn build_connected_v6(address: &str, prefix: u8, sw_if_index: u32) -> Option<rib
         metric: 0,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     })
 }
 

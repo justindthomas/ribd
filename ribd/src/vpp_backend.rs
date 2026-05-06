@@ -33,11 +33,17 @@ impl VppBackend {
     /// Apply a batch of deltas to VPP with bounded pipelining.
     /// Up to [`PIPELINE_DEPTH`] requests are in flight concurrently;
     /// individual failures are logged and do not abort the batch.
+    ///
+    /// Withdraws use the prefix's installed `table_id` if known; for
+    /// pure withdrawals (delta.new is None) we don't have an
+    /// InstalledRoute to read from, so we fall back to table 0. The
+    /// RIB carries enough state to do better here once we key by
+    /// (table_id, prefix); see Phase-2 follow-up.
     pub async fn apply(&self, vpp: &VppClient, deltas: &[Delta]) {
         stream::iter(deltas.iter())
             .for_each_concurrent(PIPELINE_DEPTH, |d| async move {
                 match &d.new {
-                    None => match delete_route(vpp, d.prefix).await {
+                    None => match delete_route(vpp, d.prefix, 0).await {
                         Err(e) => {
                             tracing::warn!(prefix = %d.prefix, "VPP delete failed: {}", e);
                         }
@@ -45,25 +51,29 @@ impl VppBackend {
                             tracing::info!(prefix = %d.prefix, "withdrew route");
                         }
                     },
-                    Some(r) => match add_route(vpp, d.prefix, &r.next_hops).await {
-                        Err(e) => {
-                            tracing::warn!(
-                                prefix = %d.prefix,
-                                source = r.source.as_str(),
-                                "VPP add failed: {}", e
-                            );
+                    Some(r) => {
+                        match add_route(vpp, d.prefix, &r.next_hops, r.table_id).await {
+                            Err(e) => {
+                                tracing::warn!(
+                                    prefix = %d.prefix,
+                                    source = r.source.as_str(),
+                                    table_id = r.table_id,
+                                    "VPP add failed: {}", e
+                                );
+                            }
+                            Ok(()) => {
+                                tracing::info!(
+                                    prefix = %d.prefix,
+                                    source = r.source.as_str(),
+                                    ad = r.admin_distance,
+                                    metric = r.metric,
+                                    table_id = r.table_id,
+                                    paths = r.next_hops.len(),
+                                    "installed route"
+                                );
+                            }
                         }
-                        Ok(()) => {
-                            tracing::info!(
-                                prefix = %d.prefix,
-                                source = r.source.as_str(),
-                                ad = r.admin_distance,
-                                metric = r.metric,
-                                paths = r.next_hops.len(),
-                                "installed route"
-                            );
-                        }
-                    },
+                    }
                 }
             })
             .await;
@@ -74,6 +84,7 @@ async fn add_route(
     vpp: &VppClient,
     prefix: Prefix,
     next_hops: &[NextHop],
+    table_id: u32,
 ) -> Result<(), vpp_api::VppError> {
     if next_hops.is_empty() {
         return Err(vpp_api::VppError::ApiError {
@@ -112,7 +123,7 @@ async fn add_route(
             is_add: true,
             is_multipath: next_hops.len() > 1,
             route: IpRoute {
-                table_id: 0,
+                table_id,
                 stats_index: 0,
                 prefix: vpp_prefix,
                 n_paths,
@@ -123,13 +134,17 @@ async fn add_route(
     if reply.retval != 0 {
         return Err(vpp_api::VppError::ApiError {
             retval: reply.retval,
-            message: format!("ip_route_add_del add for {}", prefix),
+            message: format!("ip_route_add_del add for {} (table {})", prefix, table_id),
         });
     }
     Ok(())
 }
 
-async fn delete_route(vpp: &VppClient, prefix: Prefix) -> Result<(), vpp_api::VppError> {
+async fn delete_route(
+    vpp: &VppClient,
+    prefix: Prefix,
+    table_id: u32,
+) -> Result<(), vpp_api::VppError> {
     let vpp_prefix = match prefix.af {
         Af::V4 => {
             let mut v4 = [0u8; 4];
@@ -143,7 +158,7 @@ async fn delete_route(vpp: &VppClient, prefix: Prefix) -> Result<(), vpp_api::Vp
             is_add: false,
             is_multipath: false,
             route: IpRoute {
-                table_id: 0,
+                table_id,
                 stats_index: 0,
                 prefix: vpp_prefix,
                 n_paths: 0,

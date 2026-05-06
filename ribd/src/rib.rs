@@ -47,6 +47,10 @@ struct Entry {
     metric: u32,
     next_hops: Vec<NextHop>,
     tag: u32,
+    /// VRF / FIB table-id this candidate was sent for. Carried
+    /// through to InstalledEntry on win and out to backends so
+    /// the route lands in the right VPP/kernel table.
+    table_id: u32,
 }
 
 impl Entry {
@@ -56,6 +60,7 @@ impl Entry {
             metric: r.metric,
             next_hops: r.next_hops.clone(),
             tag: r.tag,
+            table_id: r.table_id,
         }
     }
 
@@ -80,12 +85,20 @@ struct InstalledEntry {
     /// `recursive_addr` is the producer-supplied IP; the
     /// `through_prefix` is the LPM winner used to resolve.
     resolved_via: Option<ResolvedNextHop>,
+    /// VRF / FIB table-id the route is installed in.
+    table_id: u32,
 }
 
 /// A delta produced by a RIB mutation — what the backend needs to
 /// program. `None` for `new` means "withdraw this prefix entirely".
+///
+/// `table_id` is the VRF the (with)drawal happens in. Withdraws
+/// carry it explicitly so backends can target the right kernel /
+/// VPP table, since the InstalledRoute (which would otherwise
+/// supply it) is `None` in that case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delta {
+    pub table_id: u32,
     pub prefix: Prefix,
     pub new: Option<InstalledRoute>,
 }
@@ -100,9 +113,17 @@ struct NhResolution {
 }
 
 /// Pure dependency index for recursive next-hops: maps each
-/// `(Af, recursive nexthop IP)` to the set of `(Prefix, Source)`
-/// candidates that have at least one Recursive next-hop pointing at
-/// that IP.
+/// `(table_id, Af, recursive nexthop IP)` to the set of
+/// `(table_id, Prefix, Source)` candidates that have at least one
+/// Recursive next-hop pointing at that IP.
+///
+/// **VRF scope**: the `table_id` is part of both the lookup key and
+/// the dependent identity. Recursive resolution does NOT cross VRFs
+/// in Phase 1 — a recursive next-hop in VRF A resolves only against
+/// VRF A's installed table. Cross-VRF leak is a route-leaking
+/// feature deferred to Phase 4; until then, dependent identity
+/// matches the table the *route* lives in (the same table the
+/// recursive lookup happens in).
 ///
 /// We deliberately do NOT cache the resolution itself here. Caching
 /// it created a stale-state bug: install-time used [`Rib::recompute`]
@@ -113,25 +134,36 @@ struct NhResolution {
 /// O(sources_for_this_prefix) thanks to the `by_prefix` index, and
 /// `lpm_resolve` is O(prefix-length-bits) thanks to direct masked
 /// HashMap lookups.
-///
-/// The address family is part of the key so v4 and v6 nexthops with
-/// numerically-equal byte patterns don't collide and so cascade can
-/// match each entry against its same-family changed prefixes only.
 #[derive(Debug, Default)]
 struct NexthopTracker {
-    entries: HashMap<(Af, [u8; 16]), HashSet<(Prefix, Source)>>,
+    entries: HashMap<(u32, Af, [u8; 16]), HashSet<(u32, Prefix, Source)>>,
 }
 
 impl NexthopTracker {
-    fn add_dependent(&mut self, af: Af, addr: [u8; 16], dep: (Prefix, Source)) {
-        self.entries.entry((af, addr)).or_default().insert(dep);
+    fn add_dependent(
+        &mut self,
+        table_id: u32,
+        af: Af,
+        addr: [u8; 16],
+        dep: (u32, Prefix, Source),
+    ) {
+        self.entries
+            .entry((table_id, af, addr))
+            .or_default()
+            .insert(dep);
     }
 
-    fn remove_dependent(&mut self, af: Af, addr: [u8; 16], dep: (Prefix, Source)) {
-        if let Some(set) = self.entries.get_mut(&(af, addr)) {
+    fn remove_dependent(
+        &mut self,
+        table_id: u32,
+        af: Af,
+        addr: [u8; 16],
+        dep: (u32, Prefix, Source),
+    ) {
+        if let Some(set) = self.entries.get_mut(&(table_id, af, addr)) {
             set.remove(&dep);
             if set.is_empty() {
-                self.entries.remove(&(af, addr));
+                self.entries.remove(&(table_id, af, addr));
             }
         }
     }
@@ -142,19 +174,24 @@ impl NexthopTracker {
 /// cycles per RFC 4271, but defense in depth).
 const CASCADE_ITERATION_BOUND: usize = 8;
 
+/// A composite RIB key. Two routes for the same prefix in
+/// different VRFs are independent entries.
+type RibKey = (u32, Prefix, Source);
+
 #[derive(Debug, Default)]
 pub struct Rib {
-    /// (prefix, source) -> candidate entry. Producer-supplied;
-    /// next-hops may be Recursive. The indexes below let us answer
-    /// "which sources have a candidate for prefix P?" and "which
-    /// prefixes does source S own?" without scanning the whole map,
-    /// which matters at DFZ scale (1M+ candidates).
-    candidates: HashMap<(Prefix, Source), Entry>,
-    by_prefix: HashMap<Prefix, HashSet<Source>>,
-    by_source: HashMap<Source, HashSet<Prefix>>,
-    /// Currently-installed winner per prefix. Entry holds resolved
-    /// (Direct-only) next-hops.
-    installed: HashMap<Prefix, (Source, InstalledEntry)>,
+    /// (table_id, prefix, source) -> candidate entry.
+    /// Producer-supplied; next-hops may be Recursive. The indexes
+    /// below let us answer "which sources have a candidate for
+    /// (table, prefix)?" and "which (table, prefixes) does source S
+    /// own?" without scanning the whole map, which matters at DFZ
+    /// scale (1M+ candidates).
+    candidates: HashMap<RibKey, Entry>,
+    by_prefix: HashMap<(u32, Prefix), HashSet<Source>>,
+    by_source: HashMap<Source, HashSet<(u32, Prefix)>>,
+    /// Currently-installed winner per (table_id, prefix). Entry
+    /// holds resolved (Direct-only) next-hops.
+    installed: HashMap<(u32, Prefix), (Source, InstalledEntry)>,
     /// Per-recursive-nexthop dependency index.
     nh_tracker: NexthopTracker,
 }
@@ -172,69 +209,95 @@ impl Rib {
     /// Insert/replace a single candidate slot, keeping the prefix
     /// and source indexes in sync. Centralises the bookkeeping so
     /// the mutator paths stay readable.
-    fn insert_candidate(&mut self, prefix: Prefix, source: Source, entry: Entry) {
-        self.candidates.insert((prefix, source), entry);
-        self.by_prefix.entry(prefix).or_default().insert(source);
-        self.by_source.entry(source).or_default().insert(prefix);
+    fn insert_candidate(&mut self, table_id: u32, prefix: Prefix, source: Source, entry: Entry) {
+        self.candidates
+            .insert((table_id, prefix, source), entry);
+        self.by_prefix
+            .entry((table_id, prefix))
+            .or_default()
+            .insert(source);
+        self.by_source
+            .entry(source)
+            .or_default()
+            .insert((table_id, prefix));
     }
 
     /// Remove a candidate slot and drop tracker dependents for any
     /// Recursive next-hops it held. Returns the removed entry so
     /// callers can react to its tag/etc. if needed.
-    fn delete_candidate(&mut self, prefix: Prefix, source: Source) -> Option<Entry> {
-        let entry = self.candidates.remove(&(prefix, source))?;
-        if let Some(set) = self.by_prefix.get_mut(&prefix) {
+    fn delete_candidate(
+        &mut self,
+        table_id: u32,
+        prefix: Prefix,
+        source: Source,
+    ) -> Option<Entry> {
+        let entry = self.candidates.remove(&(table_id, prefix, source))?;
+        if let Some(set) = self.by_prefix.get_mut(&(table_id, prefix)) {
             set.remove(&source);
             if set.is_empty() {
-                self.by_prefix.remove(&prefix);
+                self.by_prefix.remove(&(table_id, prefix));
             }
         }
         if let Some(set) = self.by_source.get_mut(&source) {
-            set.remove(&prefix);
+            set.remove(&(table_id, prefix));
             if set.is_empty() {
                 self.by_source.remove(&source);
             }
         }
         for nh in &entry.next_hops {
             if nh.is_recursive() {
-                self.nh_tracker
-                    .remove_dependent(prefix.af, nh.addr, (prefix, source));
+                self.nh_tracker.remove_dependent(
+                    table_id,
+                    prefix.af,
+                    nh.addr,
+                    (table_id, prefix, source),
+                );
             }
         }
         Some(entry)
     }
 
-    /// Add or replace a single (prefix, source) slot. Returns the
-    /// set of deltas that affect the installed table — usually one
-    /// (the prefix being upserted), but recursive cascades may add
-    /// more if dependents change resolution.
+    /// Add or replace a single (table_id, prefix, source) slot.
+    /// Returns the set of deltas that affect the installed table —
+    /// usually one, but recursive cascades may add more.
     pub fn upsert(&mut self, route: &Route) -> Vec<Delta> {
         let new_entry = Entry::from_route(route);
         let af = route.prefix.af;
+        let table_id = route.table_id;
 
         // Drop tracker dependents for the previous version of this
-        // candidate (if any). delete_candidate would also remove the
-        // entry, so do this manually to avoid a churned re-insert.
-        if let Some(prev) = self.candidates.get(&(route.prefix, route.source)) {
+        // candidate (if any).
+        if let Some(prev) = self
+            .candidates
+            .get(&(table_id, route.prefix, route.source))
+        {
             for nh in &prev.next_hops {
                 if nh.is_recursive() {
-                    self.nh_tracker
-                        .remove_dependent(af, nh.addr, (route.prefix, route.source));
+                    self.nh_tracker.remove_dependent(
+                        table_id,
+                        af,
+                        nh.addr,
+                        (table_id, route.prefix, route.source),
+                    );
                 }
             }
         }
         for nh in &new_entry.next_hops {
             if nh.is_recursive() {
-                self.nh_tracker
-                    .add_dependent(af, nh.addr, (route.prefix, route.source));
+                self.nh_tracker.add_dependent(
+                    table_id,
+                    af,
+                    nh.addr,
+                    (table_id, route.prefix, route.source),
+                );
             }
         }
-        self.insert_candidate(route.prefix, route.source, new_entry);
+        self.insert_candidate(table_id, route.prefix, route.source, new_entry);
 
         let mut deltas = Vec::new();
         let mut changed = Vec::new();
-        if let Some(d) = self.recompute(route.prefix) {
-            changed.push(d.prefix);
+        if let Some(d) = self.recompute(table_id, route.prefix) {
+            changed.push((d.table_id, d.prefix));
             deltas.push(d);
         }
         if !changed.is_empty() {
@@ -243,17 +306,16 @@ impl Rib {
         deltas
     }
 
-    /// Remove a single (prefix, source) slot. Returns deltas for the
-    /// installed-set changes (own withdrawal + any cascading
-    /// dependent re-resolutions).
-    pub fn remove(&mut self, prefix: Prefix, source: Source) -> Vec<Delta> {
-        if self.delete_candidate(prefix, source).is_none() {
+    /// Remove a single (table_id, prefix, source) slot. Returns
+    /// deltas for the installed-set changes.
+    pub fn remove(&mut self, table_id: u32, prefix: Prefix, source: Source) -> Vec<Delta> {
+        if self.delete_candidate(table_id, prefix, source).is_none() {
             return Vec::new();
         }
         let mut deltas = Vec::new();
         let mut changed = Vec::new();
-        if let Some(d) = self.recompute(prefix) {
-            changed.push(d.prefix);
+        if let Some(d) = self.recompute(table_id, prefix) {
+            changed.push((d.table_id, d.prefix));
             deltas.push(d);
         }
         if !changed.is_empty() {
@@ -263,106 +325,114 @@ impl Rib {
     }
 
     /// Bulk replace everything from `source` with exactly `routes`.
-    /// Returns the set of deltas that affect the installed table.
+    /// Routes may span multiple VRFs; existing routes for `source` in
+    /// any VRF that aren't in the new bulk get withdrawn. Per-VRF
+    /// producer instances (Phase 2) push only their own VRF's routes,
+    /// so the cross-VRF semantics naturally collapse to "this is the
+    /// full state for `source` from this caller". Returns the set of
+    /// deltas that affect the installed table.
     pub fn bulk_replace(&mut self, source: Source, routes: &[Route]) -> Vec<Delta> {
-        // Existing prefixes for this source — O(this_source's_count).
-        let existing: Vec<Prefix> = self
+        // Existing (table_id, prefix) for this source.
+        let existing: Vec<(u32, Prefix)> = self
             .by_source
             .get(&source)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default();
 
-        let mut incoming: HashMap<Prefix, Entry> = HashMap::with_capacity(routes.len());
+        let mut incoming: HashMap<(u32, Prefix), Entry> = HashMap::with_capacity(routes.len());
         for r in routes {
             // Defensive: if producer pushes multiple routes for the
-            // same prefix in one Bulk, the last one wins.
-            incoming.insert(r.prefix, Entry::from_route(r));
+            // same (table, prefix) in one Bulk, the last one wins.
+            incoming.insert((r.table_id, r.prefix), Entry::from_route(r));
         }
 
         let mut deltas = Vec::new();
-        let mut changed_prefixes: Vec<Prefix> = Vec::new();
+        let mut changed: Vec<(u32, Prefix)> = Vec::new();
 
-        // Prefixes that vanish in this bulk.
-        for p in &existing {
-            if !incoming.contains_key(p) {
-                self.delete_candidate(*p, source);
-                if let Some(d) = self.recompute(*p) {
-                    changed_prefixes.push(d.prefix);
+        // (table, prefix) pairs that vanish in this bulk.
+        for k in &existing {
+            if !incoming.contains_key(k) {
+                self.delete_candidate(k.0, k.1, source);
+                if let Some(d) = self.recompute(k.0, k.1) {
+                    changed.push((d.table_id, d.prefix));
                     deltas.push(d);
                 }
             }
         }
-        // Prefixes that arrive or change.
-        for (prefix, entry) in incoming {
+        // (table, prefix) pairs that arrive or change.
+        for ((table_id, prefix), entry) in incoming {
             let af = prefix.af;
-            // Update tracker for the difference between previous and
-            // new next-hops. Same shape as upsert above.
-            if let Some(prev) = self.candidates.get(&(prefix, source)) {
+            if let Some(prev) = self.candidates.get(&(table_id, prefix, source)) {
                 for nh in &prev.next_hops {
                     if nh.is_recursive() {
-                        self.nh_tracker
-                            .remove_dependent(af, nh.addr, (prefix, source));
+                        self.nh_tracker.remove_dependent(
+                            table_id,
+                            af,
+                            nh.addr,
+                            (table_id, prefix, source),
+                        );
                     }
                 }
             }
             for nh in &entry.next_hops {
                 if nh.is_recursive() {
-                    self.nh_tracker
-                        .add_dependent(af, nh.addr, (prefix, source));
+                    self.nh_tracker.add_dependent(
+                        table_id,
+                        af,
+                        nh.addr,
+                        (table_id, prefix, source),
+                    );
                 }
             }
-            self.insert_candidate(prefix, source, entry);
-            if let Some(d) = self.recompute(prefix) {
-                changed_prefixes.push(d.prefix);
+            self.insert_candidate(table_id, prefix, source, entry);
+            if let Some(d) = self.recompute(table_id, prefix) {
+                changed.push((d.table_id, d.prefix));
                 deltas.push(d);
             }
         }
-        // One cascade pass at the end of the whole bulk.
-        if !changed_prefixes.is_empty() {
-            self.cascade(changed_prefixes, &mut deltas);
+        if !changed.is_empty() {
+            self.cascade(changed, &mut deltas);
         }
         deltas
     }
 
-    /// Drop every candidate from `source`. Returns deltas for any
-    /// installed changes (used on client disconnect / expiry).
+    /// Drop every candidate from `source` (across all VRFs). Returns
+    /// deltas for any installed changes.
     pub fn drop_source(&mut self, source: Source) -> Vec<Delta> {
-        let prefixes: Vec<Prefix> = self
+        let keys: Vec<(u32, Prefix)> = self
             .by_source
             .get(&source)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default();
         let mut deltas = Vec::new();
-        let mut changed_prefixes: Vec<Prefix> = Vec::new();
-        for p in prefixes {
-            self.delete_candidate(p, source);
-            if let Some(d) = self.recompute(p) {
-                changed_prefixes.push(d.prefix);
+        let mut changed: Vec<(u32, Prefix)> = Vec::new();
+        for (table_id, p) in keys {
+            self.delete_candidate(table_id, p, source);
+            if let Some(d) = self.recompute(table_id, p) {
+                changed.push((d.table_id, d.prefix));
                 deltas.push(d);
             }
         }
-        if !changed_prefixes.is_empty() {
-            self.cascade(changed_prefixes, &mut deltas);
+        if !changed.is_empty() {
+            self.cascade(changed, &mut deltas);
         }
         deltas
     }
 
-    /// Recompute the winner for one prefix. If the installed state
-    /// changed (including disappearing or going held), return a
-    /// Delta. Resolves Recursive next-hops against the *current*
-    /// installed table.
-    fn recompute(&mut self, prefix: Prefix) -> Option<Delta> {
-        // Use by_prefix to limit the scan to this prefix's candidate
-        // set — typically 1-2 entries, never the whole RIB.
+    /// Recompute the winner for one (table_id, prefix). If the
+    /// installed state changed (including disappearing or going
+    /// held), return a Delta. Resolves Recursive next-hops against
+    /// the *current* installed table for the same VRF.
+    fn recompute(&mut self, table_id: u32, prefix: Prefix) -> Option<Delta> {
         let best = self
             .by_prefix
-            .get(&prefix)
+            .get(&(table_id, prefix))
             .and_then(|sources| {
                 sources
                     .iter()
                     .filter_map(|src| {
                         self.candidates
-                            .get(&(prefix, *src))
+                            .get(&(table_id, prefix, *src))
                             .map(|e| (*src, e.clone()))
                     })
                     .min_by(|(sa, ea), (sb, eb)| {
@@ -374,31 +444,38 @@ impl Rib {
             });
 
         let resolved = best.and_then(|(src, entry)| {
-            self.try_resolve(prefix, &entry).map(|ie| (src, ie))
+            self.try_resolve(table_id, prefix, &entry)
+                .map(|ie| (src, ie))
         });
 
-        let previous = self.installed.get(&prefix).cloned();
+        let previous = self.installed.get(&(table_id, prefix)).cloned();
         match (previous, resolved) {
             (None, None) => None,
             (None, Some((src, entry))) => {
                 let installed = to_installed(prefix, src, &entry);
-                self.installed.insert(prefix, (src, entry));
+                self.installed.insert((table_id, prefix), (src, entry));
                 Some(Delta {
+                    table_id,
                     prefix,
                     new: Some(installed),
                 })
             }
             (Some(_), None) => {
-                self.installed.remove(&prefix);
-                Some(Delta { prefix, new: None })
+                self.installed.remove(&(table_id, prefix));
+                Some(Delta {
+                    table_id,
+                    prefix,
+                    new: None,
+                })
             }
             (Some((psrc, pentry)), Some((nsrc, nentry))) => {
                 if psrc == nsrc && pentry == nentry {
                     None
                 } else {
                     let installed = to_installed(prefix, nsrc, &nentry);
-                    self.installed.insert(prefix, (nsrc, nentry));
+                    self.installed.insert((table_id, prefix), (nsrc, nentry));
                     Some(Delta {
+                        table_id,
                         prefix,
                         new: Some(installed),
                     })
@@ -420,7 +497,12 @@ impl Rib {
     ///   from the path set; the route still installs as long as at
     ///   least one path survives.
     /// - All-Recursive, none resolve: held (returns None).
-    fn try_resolve(&self, prefix: Prefix, entry: &Entry) -> Option<InstalledEntry> {
+    fn try_resolve(
+        &self,
+        table_id: u32,
+        prefix: Prefix,
+        entry: &Entry,
+    ) -> Option<InstalledEntry> {
         if !entry.has_recursive() {
             return Some(InstalledEntry {
                 admin_distance: entry.admin_distance,
@@ -428,6 +510,7 @@ impl Rib {
                 direct_next_hops: entry.next_hops.clone(),
                 tag: entry.tag,
                 resolved_via: None,
+                table_id: entry.table_id,
             });
         }
 
@@ -438,7 +521,9 @@ impl Rib {
             match nh.kind {
                 NextHopKind::Direct => direct_paths.push(*nh),
                 NextHopKind::Recursive => {
-                    if let Some(res) = self.lpm_resolve(prefix.af, nh.addr) {
+                    // Resolve within the same VRF as the route.
+                    // Cross-VRF leak isn't part of Phase 1.
+                    if let Some(res) = self.lpm_resolve(table_id, prefix.af, nh.addr) {
                         // Preserve the *original recursive next-hop
                         // IP* as the new L3 destination; use the LPM
                         // winner's egress interface for the
@@ -484,6 +569,7 @@ impl Rib {
             direct_next_hops: direct_paths,
             tag: entry.tag,
             resolved_via,
+            table_id: entry.table_id,
         })
     }
 
@@ -496,7 +582,12 @@ impl Rib {
     ///
     /// Skips matches whose installed entry has no Direct paths
     /// (held-via-cycle defense).
-    fn lpm_resolve(&self, af: Af, addr: [u8; 16]) -> Option<NhResolution> {
+    fn lpm_resolve(
+        &self,
+        table_id: u32,
+        af: Af,
+        addr: [u8; 16],
+    ) -> Option<NhResolution> {
         let max_len = match af {
             Af::V4 => 32u8,
             Af::V6 => 128u8,
@@ -504,7 +595,7 @@ impl Rib {
         for len in (0..=max_len).rev() {
             let masked = mask_addr(af, addr, len);
             let probe = Prefix { af, addr: masked, len };
-            if let Some((_src, entry)) = self.installed.get(&probe) {
+            if let Some((_src, entry)) = self.installed.get(&(table_id, probe)) {
                 if entry.direct_next_hops.is_empty() {
                     continue;
                 }
@@ -526,7 +617,7 @@ impl Rib {
     /// dependency index. Bounded to [`CASCADE_ITERATION_BOUND`]
     /// iterations so a pathological iBGP-via-iBGP cycle can't loop
     /// forever.
-    fn cascade(&mut self, mut changed: Vec<Prefix>, deltas: &mut Vec<Delta>) {
+    fn cascade(&mut self, mut changed: Vec<(u32, Prefix)>, deltas: &mut Vec<Delta>) {
         for _ in 0..CASCADE_ITERATION_BOUND {
             if changed.is_empty() {
                 break;
@@ -534,14 +625,16 @@ impl Rib {
             let round = std::mem::take(&mut changed);
 
             // Collect the set of dependents to recompute. Dedupe so
-            // we don't recompute the same prefix twice in one round
-            // when several recursive nexthops resolve through the
-            // same changed underlay prefix. Tracker entries are
-            // keyed by AF, so cross-family changes are naturally
-            // skipped.
-            let mut dependents_to_recompute: HashSet<(Prefix, Source)> = HashSet::new();
-            for changed_prefix in &round {
-                for ((af, addr), deps) in &self.nh_tracker.entries {
+            // we don't recompute the same (table, prefix) twice in
+            // one round. Tracker entries are keyed by (table, AF),
+            // so cross-family AND cross-VRF changes are naturally
+            // skipped — recursive resolution stays within a VRF.
+            let mut dependents_to_recompute: HashSet<(u32, Prefix, Source)> = HashSet::new();
+            for (changed_table, changed_prefix) in &round {
+                for ((track_table, af, addr), deps) in &self.nh_tracker.entries {
+                    if *track_table != *changed_table {
+                        continue;
+                    }
                     if *af != changed_prefix.af {
                         continue;
                     }
@@ -553,13 +646,9 @@ impl Rib {
                 }
             }
 
-            for (dep_prefix, _dep_source) in dependents_to_recompute {
-                if let Some(d) = self.recompute(dep_prefix) {
-                    // The dependent's own installed state changed —
-                    // it might in turn cover some other tracker
-                    // entry (iBGP-via-iBGP). Queue it for the next
-                    // iteration.
-                    changed.push(d.prefix);
+            for (dep_table, dep_prefix, _dep_source) in dependents_to_recompute {
+                if let Some(d) = self.recompute(dep_table, dep_prefix) {
+                    changed.push((d.table_id, d.prefix));
                     deltas.push(d);
                 }
             }
@@ -569,32 +658,40 @@ impl Rib {
     pub fn installed_routes(&self) -> Vec<InstalledRoute> {
         self.installed
             .iter()
-            .map(|(prefix, (src, entry))| to_installed(*prefix, *src, entry))
+            .map(|((_table_id, prefix), (src, entry))| to_installed(*prefix, *src, entry))
             .collect()
     }
 
     pub fn all_candidates(&self) -> Vec<PrefixCandidates> {
-        // Group candidates by prefix.
-        let mut by_prefix: HashMap<Prefix, Vec<(Source, Entry)>> = HashMap::new();
-        for ((prefix, source), entry) in &self.candidates {
-            by_prefix
-                .entry(*prefix)
+        // Group candidates by (table_id, prefix). PrefixCandidates
+        // carries `table_id` so two VRFs with the same prefix
+        // surface as independent entries — important for any
+        // operator running overlapping RFC1918 across customer
+        // VRFs.
+        let mut grouped: HashMap<(u32, Prefix), Vec<(Source, Entry)>> = HashMap::new();
+        for ((table_id, prefix, source), entry) in &self.candidates {
+            grouped
+                .entry((*table_id, *prefix))
                 .or_default()
                 .push((*source, entry.clone()));
         }
         let mut out = Vec::new();
-        for (prefix, mut entries) in by_prefix {
+        for ((table_id, prefix), mut entries) in grouped {
             entries.sort_by(|(sa, ea), (sb, eb)| {
                 ea.admin_distance
                     .cmp(&eb.admin_distance)
                     .then(ea.metric.cmp(&eb.metric))
                     .then(sa.cmp(sb))
             });
-            let installed_src = self.installed.get(&prefix).map(|(s, _)| *s);
+            let installed_src = self
+                .installed
+                .get(&(table_id, prefix))
+                .map(|(s, _)| *s);
             let candidates = entries
                 .into_iter()
                 .map(|(source, entry)| {
-                    let held = entry.has_recursive() && self.try_resolve(prefix, &entry).is_none();
+                    let held = entry.has_recursive()
+                        && self.try_resolve(table_id, prefix, &entry).is_none();
                     Candidate {
                         source,
                         admin_distance: entry.admin_distance,
@@ -605,7 +702,11 @@ impl Rib {
                     }
                 })
                 .collect();
-            out.push(PrefixCandidates { prefix, candidates });
+            out.push(PrefixCandidates {
+                prefix,
+                candidates,
+                table_id,
+            });
         }
         out
     }
@@ -619,6 +720,7 @@ fn to_installed(prefix: Prefix, source: Source, entry: &InstalledEntry) -> Insta
         metric: entry.metric,
         next_hops: entry.direct_next_hops.clone(),
         resolved_via: entry.resolved_via.clone(),
+        table_id: entry.table_id,
     }
 }
 
@@ -682,6 +784,7 @@ mod tests {
             metric,
             tag: 0,
             admin_distance: None,
+            table_id: 0,
         }
     }
 
@@ -693,6 +796,7 @@ mod tests {
             metric: 0,
             tag: 0,
             admin_distance: None,
+            table_id: 0,
         }
     }
 
@@ -742,7 +846,7 @@ mod tests {
         rib.upsert(&r(prefix, Source::Bgp, 100, 2));
         assert_eq!(rib.installed_routes()[0].source, Source::Bgp);
 
-        let d = one(rib.remove(prefix, Source::Bgp));
+        let d = one(rib.remove(0, prefix, Source::Bgp));
         let inst = d.new.unwrap();
         assert_eq!(inst.source, Source::OspfIntra);
     }
@@ -752,7 +856,7 @@ mod tests {
         let mut rib = Rib::new();
         let prefix = p4(10, 4, 0, 0, 24);
         rib.upsert(&r(prefix, Source::Static, 0, 1));
-        let d = one(rib.remove(prefix, Source::Static));
+        let d = one(rib.remove(0, prefix, Source::Static));
         assert!(d.new.is_none());
         assert_eq!(rib.installed_count(), 0);
     }
@@ -951,7 +1055,7 @@ mod tests {
         assert_eq!(rib.installed_count(), 2);
 
         // Withdraw IGP. BGP should go back to held.
-        let deltas = rib.remove(igp_prefix, Source::OspfIntra);
+        let deltas = rib.remove(0, igp_prefix, Source::OspfIntra);
         assert_eq!(deltas.len(), 2);
         // Both deltas should have new=None (withdrawals).
         for d in &deltas {
@@ -1018,6 +1122,7 @@ mod tests {
             metric: 0,
             tag: 0,
             admin_distance: None,
+            table_id: 0,
         };
         rib.upsert(&connected_route);
 
@@ -1057,7 +1162,11 @@ mod tests {
         // Tracker should have ONE entry for 10.0.0.5 with 5 dependents.
         let mut shared_addr = [0u8; 16];
         shared_addr[..4].copy_from_slice(&[10, 0, 0, 5]);
-        let tracker_entry = rib.nh_tracker.entries.get(&(Af::V4, shared_addr)).unwrap();
+        let tracker_entry = rib
+            .nh_tracker
+            .entries
+            .get(&(0, Af::V4, shared_addr))
+            .unwrap();
         assert_eq!(tracker_entry.len(), 5);
 
         // Replace IGP route with a different egress.
@@ -1112,11 +1221,16 @@ mod tests {
         rib.upsert(&r_recursive(bgp_prefix, Source::Bgp, Ipv4Addr::new(10, 0, 0, 5)));
 
         // Remove the BGP route.
-        rib.remove(bgp_prefix, Source::Bgp);
+        rib.remove(0, bgp_prefix, Source::Bgp);
 
         // Tracker should be empty (no dependents → entry removed).
         let mut shared_addr = [0u8; 16];
         shared_addr[..4].copy_from_slice(&[10, 0, 0, 5]);
-        assert!(rib.nh_tracker.entries.get(&(Af::V4, shared_addr)).is_none());
+        assert!(
+            rib.nh_tracker
+                .entries
+                .get(&(0, Af::V4, shared_addr))
+                .is_none()
+        );
     }
 }

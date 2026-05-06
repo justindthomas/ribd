@@ -278,7 +278,9 @@ async fn handle_message(
                 let mut rib = state.rib.lock().await;
                 match action {
                     ribd_proto::Action::Add => rib.upsert(&route),
-                    ribd_proto::Action::Delete => rib.remove(route.prefix, route.source),
+                    ribd_proto::Action::Delete => {
+                        rib.remove(route.table_id, route.prefix, route.source)
+                    }
                 }
             };
             if !deltas.is_empty() {
@@ -438,6 +440,7 @@ mod tests {
             metric: 10,
             tag: 0,
             admin_distance: None,
+            table_id: 0,
         }
     }
 

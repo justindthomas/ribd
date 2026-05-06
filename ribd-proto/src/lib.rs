@@ -14,7 +14,12 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire-protocol version. Bumped from 1 → 2 when `Route` and
+/// `InstalledRoute` gained the `table_id` field (VRF support).
+/// Producers and ribd must agree on the version; mixing v1 and
+/// v2 binaries will desync at the first `Bulk` or `Update`
+/// because bincode decodes positionally.
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_SOCKET_PATH: &str = "/run/ribd.sock";
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
@@ -216,6 +221,12 @@ pub struct Route {
     /// the source's default AD. Producers can set this explicitly
     /// to hoist a route above its peers.
     pub admin_distance: Option<u8>,
+    /// VPP FIB table-id (a.k.a. VRF id) that this route lives in.
+    /// `0` is the default VRF. Producers that don't yet know about
+    /// VRFs send `0` and ribd programs the default FIB. When per-
+    /// VRF protocol instances arrive in Phase 2, each instance
+    /// stamps its routes with the operator-assigned table-id.
+    pub table_id: u32,
 }
 
 impl Route {
@@ -278,6 +289,9 @@ pub struct InstalledRoute {
     /// producer-supplied next-hop IP plus the RIB entry it resolved
     /// through. `None` for non-recursive routes.
     pub resolved_via: Option<ResolvedNextHop>,
+    /// VRF (FIB table-id) the route was installed in. `0` is the
+    /// default VRF.
+    pub table_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +313,11 @@ pub struct Candidate {
 pub struct PrefixCandidates {
     pub prefix: Prefix,
     pub candidates: Vec<Candidate>,
+    /// VRF (FIB table-id) the candidate set belongs to. `0` is
+    /// the default VRF. Two PrefixCandidates with the same
+    /// `prefix` but different `table_id` are independent —
+    /// e.g. two customer VRFs both reusing 10.0.0.0/24.
+    pub table_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +435,7 @@ mod tests {
                 metric: 10,
                 tag: 0,
                 admin_distance: None,
+                table_id: 0,
             }],
         };
         let frame = encode(&msg).unwrap();
@@ -442,6 +462,7 @@ mod tests {
             metric: 10,
             next_hops: vec![NextHop::v6("fe80::1".parse().unwrap(), 1)],
             resolved_via: None,
+            table_id: 0,
         }]));
         let frame = encode(&msg).unwrap();
         let decoded: ServerMsg = decode(&frame[4..]).unwrap();
@@ -486,6 +507,7 @@ mod tests {
                 metric: 0,
                 tag: 0,
                 admin_distance: None,
+                table_id: 0,
             }],
         };
         let end = ClientMsg::BulkEnd {
@@ -513,6 +535,7 @@ mod tests {
                 },
                 through_prefix: Prefix::v4(Ipv4Addr::new(10, 0, 0, 0), 24),
             }),
+            table_id: 0,
         };
         let bytes = bincode::serialize(&installed).unwrap();
         let back: InstalledRoute = bincode::deserialize(&bytes).unwrap();
@@ -539,6 +562,7 @@ mod tests {
             metric: 0,
             tag: 0,
             admin_distance: Some(5),
+            table_id: 0,
         };
         assert_eq!(r.effective_admin_distance(), 5);
     }

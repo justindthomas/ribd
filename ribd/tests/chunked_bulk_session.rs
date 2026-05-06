@@ -127,7 +127,7 @@ async fn handle_one_session(stream: tokio::net::UnixStream, rib: Arc<Mutex<Rib>>
                         g.upsert(&route);
                     }
                     ribd_proto::Action::Delete => {
-                        g.remove(route.prefix, route.source);
+                        g.remove(route.table_id, route.prefix, route.source);
                     }
                 }
                 ServerMsg::Ok
@@ -163,6 +163,7 @@ fn igp_route_v4(prefix_octets: [u8; 4], len: u8, gw: [u8; 4], swi: u32) -> Route
         metric: 10,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     }
 }
 
@@ -174,6 +175,7 @@ fn bgp_recursive_v4(prefix_octets: [u8; 4], len: u8, recursive_to: [u8; 4]) -> R
         metric: 0,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     }
 }
 

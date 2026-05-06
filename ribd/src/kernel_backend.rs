@@ -274,7 +274,10 @@ impl KernelBackend {
     /// belong in a separate change once we have benchmarks.
     async fn apply_one(&self, d: &Delta, snapshot: &HashMap<u32, u32>) {
         match &d.new {
-            None => match self.delete(d.prefix).await {
+            None => match self.delete(d.prefix, 0).await {
+                // Withdraws of pure-delta routes default to table 0.
+                // Phase-2 (per-VRF RIB keying) gives us the right
+                // table here.
                 Err(e) => {
                     // Route-not-found is fine on withdraw (we may
                     // have never installed it, e.g. a losing
@@ -309,12 +312,13 @@ impl KernelBackend {
                 // Replace semantics: delete any existing entry
                 // first, then add. rtnetlink add will fail if an
                 // entry already exists.
-                let _ = self.delete(d.prefix).await;
+                let _ = self.delete(d.prefix, r.table_id).await;
                 let proto = kernel_protocol_for(r.source);
-                if let Err(e) = self.add(d.prefix, &resolved, proto).await {
+                if let Err(e) = self.add(d.prefix, &resolved, proto, r.table_id).await {
                     tracing::warn!(
                         prefix = %d.prefix,
                         source = r.source.as_str(),
+                        table_id = r.table_id,
                         "kernel add failed: {}", e
                     );
                 } else {
@@ -334,7 +338,18 @@ impl KernelBackend {
         prefix: Prefix,
         paths: &[(&NextHop, u32)],
         proto: RouteProtocol,
+        table_id: u32,
     ) -> Result<(), rtnetlink::Error> {
+        // Map ribd's table-id to the kernel routing-table identifier.
+        // Linux kernel routing tables are addressable by either a
+        // u8 (legacy "RT_TABLE_*") or, when tagged with the Table
+        // attribute, a full u32. table 0 = main when not VRF-tagged.
+        // For non-default tables, attach a Table attribute on the
+        // outgoing message so the kernel routes the entry to the
+        // right table. Producers that send table_id=0 keep the
+        // existing main-table behaviour.
+        use netlink_packet_route::route::RouteAttribute;
+
         // Single-path: use the high-level RouteAddRequest builder —
         // simpler and clearer for the common case.
         if paths.len() == 1 {
@@ -347,30 +362,40 @@ impl KernelBackend {
                     let mut nh_v4 = [0u8; 4];
                     nh_v4.copy_from_slice(&nh.addr[..4]);
                     let gw = Ipv4Addr::from(nh_v4);
-                    self.handle
+                    let mut req = self
+                        .handle
                         .route()
                         .add()
                         .v4()
                         .destination_prefix(dest, prefix.len)
                         .output_interface(kidx)
                         .gateway(gw)
-                        .protocol(proto)
-                        .execute()
-                        .await
+                        .protocol(proto);
+                    if table_id != 0 {
+                        req.message_mut()
+                            .attributes
+                            .push(RouteAttribute::Table(table_id));
+                    }
+                    req.execute().await
                 }
                 Af::V6 => {
                     let dest = Ipv6Addr::from(prefix.addr);
                     let gw = Ipv6Addr::from(nh.addr);
-                    self.handle
+                    let mut req = self
+                        .handle
                         .route()
                         .add()
                         .v6()
                         .destination_prefix(dest, prefix.len)
                         .output_interface(kidx)
                         .gateway(gw)
-                        .protocol(proto)
-                        .execute()
-                        .await
+                        .protocol(proto);
+                    if table_id != 0 {
+                        req.message_mut()
+                            .attributes
+                            .push(RouteAttribute::Table(table_id));
+                    }
+                    req.execute().await
                 }
             };
         }
@@ -383,9 +408,7 @@ impl KernelBackend {
         // Each RouteNextHop carries its own interface_index and a
         // Gateway attribute; the top-level Gateway/Oif MUST NOT be
         // set or the kernel rejects the request.
-        use netlink_packet_route::route::{
-            RouteAddress, RouteAttribute, RouteNextHop,
-        };
+        use netlink_packet_route::route::{RouteAddress, RouteNextHop};
         match prefix.af {
             Af::V4 => {
                 let mut v4 = [0u8; 4];
@@ -413,6 +436,11 @@ impl KernelBackend {
                 req.message_mut()
                     .attributes
                     .push(RouteAttribute::MultiPath(hops));
+                if table_id != 0 {
+                    req.message_mut()
+                        .attributes
+                        .push(RouteAttribute::Table(table_id));
+                }
                 req.execute().await
             }
             Af::V6 => {
@@ -437,17 +465,22 @@ impl KernelBackend {
                 req.message_mut()
                     .attributes
                     .push(RouteAttribute::MultiPath(hops));
+                if table_id != 0 {
+                    req.message_mut()
+                        .attributes
+                        .push(RouteAttribute::Table(table_id));
+                }
                 req.execute().await
             }
         }
     }
 
-    async fn delete(&self, prefix: Prefix) -> Result<(), rtnetlink::Error> {
+    async fn delete(&self, prefix: Prefix, table_id: u32) -> Result<(), rtnetlink::Error> {
         use futures::TryStreamExt;
-        use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+        use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteHeader, RouteMessage};
 
         // Find and delete matching routes. We search by destination
-        // prefix only — any RT table that matches, we drop.
+        // prefix and table — any matching entry gets dropped.
         let mut stream = match prefix.af {
             Af::V4 => self
                 .handle
@@ -463,6 +496,29 @@ impl KernelBackend {
         let mut to_delete: Vec<RouteMessage> = Vec::new();
         while let Some(msg) = stream.try_next().await? {
             if msg.header.destination_prefix_length != prefix.len {
+                continue;
+            }
+            // Match the table the route lives in. The kernel reports
+            // the table either in `header.table` (legacy u8) or in a
+            // RouteAttribute::Table for u32 ids. ribd's table_id is
+            // a u32; treat 0 as "main" (the legacy default).
+            let kernel_table: u32 = msg
+                .attributes
+                .iter()
+                .find_map(|attr| {
+                    if let RouteAttribute::Table(t) = attr {
+                        Some(*t)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(msg.header.table as u32);
+            let want_table: u32 = if table_id == 0 {
+                RouteHeader::RT_TABLE_MAIN as u32
+            } else {
+                table_id
+            };
+            if kernel_table != want_table {
                 continue;
             }
             // Special case: the default route (prefix length 0) has

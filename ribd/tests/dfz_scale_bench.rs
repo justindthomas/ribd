@@ -43,6 +43,7 @@ fn synth_igp_routes(count: usize) -> Vec<Route> {
             metric: 10,
             tag: 0,
             admin_distance: None,
+            table_id: 0,
         });
     }
     routes
@@ -65,6 +66,7 @@ fn synth_bgp_recursive_routes(count: usize, recursive_to: Ipv4Addr) -> Vec<Route
             metric: 0,
             tag: 0,
             admin_distance: None,
+            table_id: 0,
         });
     }
     routes
@@ -137,6 +139,7 @@ fn dfz_scale_igp_underlay_change() {
         metric: 10,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     };
 
     let t = Instant::now();
@@ -184,6 +187,7 @@ fn dfz_scale_lpm_resolve_cost() {
             metric: 0,
             tag: 0,
             admin_distance: None,
+            table_id: 0,
         });
     }
     let elapsed = t.elapsed();

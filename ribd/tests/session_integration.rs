@@ -129,7 +129,7 @@ async fn session_protocol_roundtrip() {
                     let mut rib = rib_server.lock().await;
                     let _: Vec<Delta> = match action {
                         Action::Add => rib.upsert(&route),
-                        Action::Delete => rib.remove(route.prefix, route.source),
+                        Action::Delete => rib.remove(route.table_id, route.prefix, route.source),
                     };
                     ServerMsg::Ok
                 }
@@ -177,6 +177,7 @@ async fn session_protocol_roundtrip() {
         metric: 10,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     };
     client
         .push_bulk(Source::OspfIntra, vec![route.clone()])
@@ -220,6 +221,7 @@ async fn session_ad_arbitration_across_two_clients() {
         metric: 10,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     });
     rib.upsert(&Route {
         prefix,
@@ -228,6 +230,7 @@ async fn session_ad_arbitration_across_two_clients() {
         metric: 100,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     });
 
     let installed = rib.installed_routes();

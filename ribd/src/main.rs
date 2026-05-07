@@ -709,6 +709,31 @@ async fn build_config_static(
             }
         }
 
+        // Resolve the per-route VRF to a table-id. Empty / absent
+        // / "default" → the implicit default VRF (table 0). A
+        // named VRF must match a declared `vrfs:` entry; on miss
+        // we drop the route with a warning rather than silently
+        // landing it in table 0 (which is what created the
+        // operator-visible default-VRF blackhole that motivated
+        // this field in the first place).
+        let table_id = match r.vrf.as_deref().filter(|s| !s.is_empty() && *s != "default") {
+            None => 0,
+            Some(name) => match cfg.vrfs.iter().find(|v| v.name == name) {
+                Some(v) => match prefix.af {
+                    Af::V4 => v.table_id_v4,
+                    Af::V6 => v.table_id_v6,
+                },
+                None => {
+                    tracing::warn!(
+                        destination = %r.destination,
+                        vrf = name,
+                        "static route skipped: vrf not declared in vrfs:",
+                    );
+                    continue;
+                }
+            },
+        };
+
         out.push(Route {
             prefix,
             source: Source::Static,
@@ -720,7 +745,7 @@ async fn build_config_static(
             metric: 0,
             tag: 0,
             admin_distance: None,
-            table_id: 0,
+            table_id,
         });
     }
     out

@@ -39,6 +39,20 @@ pub struct RouterConfig {
     pub bvi_domains: Vec<BviDomain>,
     #[serde(default)]
     pub tunnels: Vec<Tunnel>,
+    /// Declared VRFs. impd's apply path is the only thing that
+    /// validates this list; ribd just consumes it to translate
+    /// `routes[].vrf` (a name) into a table-id at static-build
+    /// time. Default-VRF entries (vrf empty / "default") never
+    /// reach this list — they pass through with table_id 0.
+    #[serde(default)]
+    pub vrfs: Vec<Vrf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Vrf {
+    pub name: String,
+    pub table_id_v4: u32,
+    pub table_id_v6: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,6 +92,13 @@ pub struct StaticRoute {
     pub via: String,
     #[serde(default)]
     pub interface: Option<String>,
+    /// VRF the route belongs to. Empty / absent / "default" means
+    /// the implicit default VRF (table 0). Otherwise must match a
+    /// declared VRF name; ribd looks up the matching `Vrf` and
+    /// pulls `table_id_v4` / `table_id_v6` based on the prefix's
+    /// address family.
+    #[serde(default)]
+    pub vrf: Option<String>,
 }
 
 /// Loopback interface yaml shape. Minimal — only the fields needed
@@ -281,6 +302,29 @@ dhcp_server:
             resolve_via_interface(via, &ifaces).as_deref(),
             Some("lan.110")
         );
+    }
+
+    #[test]
+    fn parses_vrfs_and_per_route_vrf() {
+        let yaml = r#"
+vrfs:
+  - name: customer_vrf
+    table_id_v4: 10
+    table_id_v6: 10
+routes:
+  - destination: 0.0.0.0/0
+    via: 192.168.37.1
+    vrf: customer_vrf
+  - destination: 10.50.0.0/24
+    via: 23.177.24.8
+"#;
+        let cfg: RouterConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.vrfs.len(), 1);
+        assert_eq!(cfg.vrfs[0].name, "customer_vrf");
+        assert_eq!(cfg.vrfs[0].table_id_v4, 10);
+        assert_eq!(cfg.routes.len(), 2);
+        assert_eq!(cfg.routes[0].vrf.as_deref(), Some("customer_vrf"));
+        assert_eq!(cfg.routes[1].vrf, None);
     }
 
     #[test]

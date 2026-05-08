@@ -899,6 +899,38 @@ mod tests {
         assert_eq!(deltas[0].new.as_ref().unwrap().source, Source::OspfIntra);
     }
 
+    /// Regression for a wrong-table-id bug in the VPP and kernel
+    /// backends: withdrawals from a non-default VRF must produce a
+    /// Delta carrying that VRF's `table_id`, so the backends issue
+    /// the delete against the correct FIB. Covers both withdrawal
+    /// paths cited in the audit (producer disconnect via
+    /// `drop_source`, and explicit `remove`).
+    #[test]
+    fn test_withdraw_from_non_default_vrf_carries_table_id() {
+        let mut rib = Rib::new();
+        let prefix = p4(10, 7, 0, 0, 24);
+        let route = Route {
+            prefix,
+            source: Source::Bgp,
+            next_hops: vec![NextHop::v4(Ipv4Addr::new(10, 0, 0, 1), 1)],
+            metric: 100,
+            tag: 0,
+            admin_distance: None,
+            table_id: 1,
+        };
+        rib.upsert(&route);
+
+        let on_drop = one(rib.drop_source(Source::Bgp));
+        assert!(on_drop.new.is_none(), "drop_source should withdraw");
+        assert_eq!(on_drop.prefix, prefix);
+        assert_eq!(on_drop.table_id, 1, "withdraw must target VRF 1, not 0");
+
+        rib.upsert(&route);
+        let on_remove = one(rib.remove(1, prefix, Source::Bgp));
+        assert!(on_remove.new.is_none(), "remove should withdraw");
+        assert_eq!(on_remove.table_id, 1, "remove must target VRF 1, not 0");
+    }
+
     #[test]
     fn test_metric_breaks_ad_tie() {
         let mut rib = Rib::new();

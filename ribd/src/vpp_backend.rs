@@ -33,17 +33,11 @@ impl VppBackend {
     /// Apply a batch of deltas to VPP with bounded pipelining.
     /// Up to [`PIPELINE_DEPTH`] requests are in flight concurrently;
     /// individual failures are logged and do not abort the batch.
-    ///
-    /// Withdraws use the prefix's installed `table_id` if known; for
-    /// pure withdrawals (delta.new is None) we don't have an
-    /// InstalledRoute to read from, so we fall back to table 0. The
-    /// RIB carries enough state to do better here once we key by
-    /// (table_id, prefix); see Phase-2 follow-up.
     pub async fn apply(&self, vpp: &VppClient, deltas: &[Delta]) {
         stream::iter(deltas.iter())
             .for_each_concurrent(PIPELINE_DEPTH, |d| async move {
                 match &d.new {
-                    None => match delete_route(vpp, d.prefix, 0).await {
+                    None => match delete_route(vpp, d.prefix, d.table_id).await {
                         Err(e) => {
                             tracing::warn!(prefix = %d.prefix, "VPP delete failed: {}", e);
                         }
@@ -92,6 +86,14 @@ async fn add_route(
             message: format!("no paths for {}", prefix),
         });
     }
+    let n_paths = u8::try_from(next_hops.len()).map_err(|_| vpp_api::VppError::ApiError {
+        retval: -1,
+        message: format!(
+            "too many ECMP paths ({}) for {} — VPP n_paths is u8",
+            next_hops.len(),
+            prefix
+        ),
+    })?;
 
     let paths: Vec<FibPath> = match prefix.af {
         Af::V4 => next_hops
@@ -107,7 +109,6 @@ async fn add_route(
             .map(|nh| FibPath::via_ipv6(nh.addr, nh.sw_if_index))
             .collect(),
     };
-    let n_paths = paths.len() as u8;
 
     let vpp_prefix = match prefix.af {
         Af::V4 => {

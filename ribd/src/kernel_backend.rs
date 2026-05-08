@@ -274,10 +274,7 @@ impl KernelBackend {
     /// belong in a separate change once we have benchmarks.
     async fn apply_one(&self, d: &Delta, snapshot: &HashMap<u32, u32>) {
         match &d.new {
-            None => match self.delete(d.prefix, 0).await {
-                // Withdraws of pure-delta routes default to table 0.
-                // Phase-2 (per-VRF RIB keying) gives us the right
-                // table here.
+            None => match self.delete(d.prefix, d.table_id).await {
                 Err(e) => {
                     // Route-not-found is fine on withdraw (we may
                     // have never installed it, e.g. a losing

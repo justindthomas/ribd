@@ -3,7 +3,7 @@
 //! Producers (ospfd, bgpd, dhcpd, or any other route source)
 //! speak to ribd over a Unix socket at `/run/ribd.sock`.
 //! Frames are length-prefixed: a 4-byte big-endian u32 length, then
-//! a bincode-encoded [`ClientMsg`] or [`ServerMsg`] body.
+//! a postcard-encoded [`ClientMsg`] or [`ServerMsg`] body.
 //!
 //! Crate contains ONLY serde types, framing helpers, and small pure
 //! utilities. It does NOT pull in rtnetlink or vpp-api so that client
@@ -14,12 +14,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Wire-protocol version. Bumped from 1 → 2 when `Route` and
-/// `InstalledRoute` gained the `table_id` field (VRF support).
-/// Producers and ribd must agree on the version; mixing v1 and
-/// v2 binaries will desync at the first `Bulk` or `Update`
-/// because bincode decodes positionally.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Wire-protocol version. Bumped to 3 when the codec switched from
+/// bincode 1.x (RUSTSEC-2025-0141, unmaintained) to postcard. The
+/// frame body shape changes incompatibly between bincode and
+/// postcard, so version 3 also signals "postcard codec"; an old
+/// peer's Hello will decode as garbage and the session closes
+/// before any Bulk/Update reaches the RIB.
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_SOCKET_PATH: &str = "/run/ribd.sock";
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
@@ -394,8 +395,8 @@ pub enum CodecError {
     Io(#[from] std::io::Error),
     #[error("frame too large: {0} bytes (max {})", MAX_FRAME_LEN)]
     FrameTooLarge(usize),
-    #[error("bincode: {0}")]
-    Bincode(#[from] bincode::Error),
+    #[error("postcard: {0}")]
+    Postcard(#[from] postcard::Error),
     #[error("peer closed connection")]
     Closed,
 }
@@ -403,7 +404,7 @@ pub enum CodecError {
 /// Encode a message as a length-prefixed frame. The returned bytes
 /// are ready to write to a socket in one shot.
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, CodecError> {
-    let payload = bincode::serialize(msg)?;
+    let payload = postcard::to_allocvec(msg)?;
     if payload.len() > MAX_FRAME_LEN {
         return Err(CodecError::FrameTooLarge(payload.len()));
     }
@@ -417,7 +418,7 @@ pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, CodecError> {
 /// length prefix). The reader side is expected to have already
 /// consumed the 4-byte length and slurped `payload_len` bytes.
 pub fn decode<'a, T: Deserialize<'a>>(payload: &'a [u8]) -> Result<T, CodecError> {
-    Ok(bincode::deserialize(payload)?)
+    Ok(postcard::from_bytes(payload)?)
 }
 
 #[cfg(test)]
@@ -486,9 +487,9 @@ mod tests {
         let direct = NextHop::v4(Ipv4Addr::new(10, 0, 0, 1), 7);
         assert!(!direct.is_recursive());
 
-        // Bincode roundtrip preserves variant.
-        let bytes = bincode::serialize(&nh).unwrap();
-        let back: NextHop = bincode::deserialize(&bytes).unwrap();
+        // Codec roundtrip preserves variant.
+        let frame = encode(&nh).unwrap();
+        let back: NextHop = decode(&frame[4..]).unwrap();
         assert_eq!(back, nh);
     }
 
@@ -537,8 +538,8 @@ mod tests {
             }),
             table_id: 0,
         };
-        let bytes = bincode::serialize(&installed).unwrap();
-        let back: InstalledRoute = bincode::deserialize(&bytes).unwrap();
+        let frame = encode(&installed).unwrap();
+        let back: InstalledRoute = decode(&frame[4..]).unwrap();
         assert_eq!(back, installed);
         assert!(back.resolved_via.is_some());
     }

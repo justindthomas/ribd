@@ -8,5 +8,5 @@ authors = ["Justin Thomas"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-bincode = "1.3"
+postcard = { version = "1", features = ["alloc"] }
 thiserror = "1"

@@ -68,7 +68,7 @@ impl RibConnection {
     /// Send a Bulk — the sole atomic replace-all primitive per source.
     /// On success the server's RIB now reflects exactly the given set
     /// of routes for that source. Bounded by `MAX_FRAME_LEN` (16 MB
-    /// of bincode-encoded routes, ~80k routes); large producers like
+    /// of postcard-encoded routes, ~80k routes); large producers like
     /// bgpd should use `push_bulk_chunked` instead.
     pub async fn push_bulk(
         &mut self,
@@ -90,7 +90,7 @@ impl RibConnection {
     /// staging buffer is discarded and the server's previous view of
     /// `source` remains in effect.
     ///
-    /// `chunk_size` should be sized so each chunk's bincode encoding
+    /// `chunk_size` should be sized so each chunk's postcard encoding
     /// stays under `MAX_FRAME_LEN` (16 MB). A safe default for IPv4
     /// unicast routes with single recursive next-hops is ~50_000.
     pub async fn push_bulk_chunked(

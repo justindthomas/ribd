@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+
+# Local Claude Code state (incl. audit-finding pointer with file:line cites)
+.claude/audit.md

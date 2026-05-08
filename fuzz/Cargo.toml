@@ -1,0 +1,47 @@
+[package]
+name = "ribd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ribd-proto]
+path = "../ribd-proto"
+# ribd-proto is the wire format — postcard-encoded ClientMsg / ServerMsg
+# / QueryRequest / QueryReply. Fuzzing here covers every IMP daemon
+# that talks over /run/ribd.sock (ribd is the receiver, ospfd/bgpd/
+# dhcpd/dnsd are senders). The decode<T> helper is generic so each
+# harness specialises it to a different message enum.
+
+[[bin]]
+name = "decode_client_msg"
+path = "fuzz_targets/decode_client_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_server_msg"
+path = "fuzz_targets/decode_server_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_query_request"
+path = "fuzz_targets/decode_query_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_query_reply"
+path = "fuzz_targets/decode_query_reply.rs"
+test = false
+doc = false
+bench = false

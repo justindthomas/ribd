@@ -359,67 +359,27 @@ impl KernelBackend {
         // outgoing message so the kernel routes the entry to the
         // right table. Producers that send table_id=0 keep the
         // existing main-table behaviour.
-        use netlink_packet_route::route::RouteAttribute;
-
-        // Single-path: use the high-level RouteAddRequest builder —
-        // simpler and clearer for the common case.
-        if paths.len() == 1 {
-            let (nh, kidx) = paths[0];
-            return match prefix.af {
-                Af::V4 => {
-                    let mut v4 = [0u8; 4];
-                    v4.copy_from_slice(&prefix.addr[..4]);
-                    let dest = Ipv4Addr::from(v4);
-                    let mut nh_v4 = [0u8; 4];
-                    nh_v4.copy_from_slice(&nh.addr[..4]);
-                    let gw = Ipv4Addr::from(nh_v4);
-                    let mut req = self
-                        .handle
-                        .route()
-                        .add()
-                        .v4()
-                        .destination_prefix(dest, prefix.len)
-                        .output_interface(kidx)
-                        .gateway(gw)
-                        .protocol(proto);
-                    if table_id != 0 {
-                        req.message_mut()
-                            .attributes
-                            .push(RouteAttribute::Table(table_id));
-                    }
-                    req.execute().await
-                }
-                Af::V6 => {
-                    let dest = Ipv6Addr::from(prefix.addr);
-                    let gw = Ipv6Addr::from(nh.addr);
-                    let mut req = self
-                        .handle
-                        .route()
-                        .add()
-                        .v6()
-                        .destination_prefix(dest, prefix.len)
-                        .output_interface(kidx)
-                        .gateway(gw)
-                        .protocol(proto);
-                    if table_id != 0 {
-                        req.message_mut()
-                            .attributes
-                            .push(RouteAttribute::Table(table_id));
-                    }
-                    req.execute().await
-                }
-            };
-        }
-
-        // Multipath (ECMP): rtnetlink 0.14's builder doesn't expose
-        // a `multipath` method, so we construct the base request for
-        // address/AF and then reach into the underlying RouteMessage
-        // to push a RouteAttribute::MultiPath with all next-hops.
         //
-        // Each RouteNextHop carries its own interface_index and a
-        // Gateway attribute; the top-level Gateway/Oif MUST NOT be
-        // set or the kernel rejects the request.
-        use netlink_packet_route::route::{RouteAddress, RouteNextHop};
+        // Always-multipath: even single-hop routes go through the
+        // RouteAttribute::MultiPath construction so we can attach
+        // RTNH_F_ONLINK per nexthop. The flag is required because
+        // VPP owns L2 forwarding; the kernel never sees ARP / ND
+        // traffic for our LCP TAPs, so its default
+        // gateway-reachability check ("is there a neighbor entry
+        // backing this gw?") fails with `Nexthop has invalid
+        // gateway` for VRF tables and `Network is unreachable`
+        // for main. ONLINK tells the kernel "I trust the gateway
+        // is on-link, don't probe" — which is true: ribd's
+        // recursive-resolver landed on direct paths whose
+        // sw_if_index points to a connected interface in VPP, and
+        // VPP's adjacency was the source of truth for that
+        // resolution. Without onlink, every gateway-routed route
+        // (BGP, OSPF, static-via-gw) silently misses the kernel
+        // FIB while still landing in VPP.
+        use netlink_packet_route::route::{
+            RouteAddress, RouteAttribute, RouteNextHop, RouteNextHopFlag,
+        };
+
         match prefix.af {
             Af::V4 => {
                 let mut v4 = [0u8; 4];
@@ -438,6 +398,7 @@ impl KernelBackend {
                     let gw = Ipv4Addr::from(nh_v4);
                     let mut hop = RouteNextHop::default();
                     hop.interface_index = *kidx;
+                    hop.flags = vec![RouteNextHopFlag::Onlink];
                     hop.attributes = vec![RouteAttribute::Gateway(
                         RouteAddress::Inet(gw),
                     )];
@@ -467,6 +428,7 @@ impl KernelBackend {
                     let gw = Ipv6Addr::from(nh.addr);
                     let mut hop = RouteNextHop::default();
                     hop.interface_index = *kidx;
+                    hop.flags = vec![RouteNextHopFlag::Onlink];
                     hop.attributes = vec![RouteAttribute::Gateway(
                         RouteAddress::Inet6(gw),
                     )];

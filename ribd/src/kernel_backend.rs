@@ -320,6 +320,20 @@ impl KernelBackend {
                     );
                     return;
                 }
+                // Connected routes are auto-added by the Linux
+                // kernel as a side-effect of `ip addr add`, with
+                // proto=kernel and the right oif/scope. ribd
+                // doesn't need to (and can't cleanly) install
+                // them via the multipath path — there's no
+                // gateway, and the multipath rtnetlink form
+                // rejects no-gateway entries with EINVAL. Skip
+                // and let the address-assignment side-effect
+                // handle these. Withdraw still runs through the
+                // delete path above (in case we ever installed
+                // one earlier under different rules).
+                if matches!(r.source, Source::Connected) {
+                    return;
+                }
                 // Replace semantics: delete any existing entry
                 // first, then add. rtnetlink add will fail if an
                 // entry already exists.

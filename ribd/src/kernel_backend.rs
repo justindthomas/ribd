@@ -291,18 +291,32 @@ impl KernelBackend {
                     match snapshot.get(&nh.sw_if_index) {
                         Some(kidx) => resolved.push((nh, *kidx)),
                         None => {
-                            tracing::debug!(
+                            // Promoted from debug → warn after a
+                            // silent-drop bug where every OSPF
+                            // route on a sub-interface created
+                            // post-startup missed the kernel FIB.
+                            // The IfIndexMap refresh path is now
+                            // wired into VPP-reconnect + SIGHUP,
+                            // but a stale-mapping warning is
+                            // cheap insurance against the next
+                            // shape of the same bug.
+                            tracing::warn!(
                                 prefix = %d.prefix,
                                 sw_if_index = nh.sw_if_index,
-                                "no kernel ifindex mapping; dropping this path"
+                                source = r.source.as_str(),
+                                table_id = r.table_id,
+                                "no kernel ifindex mapping for path; \
+                                 SIGHUP impd or restart ribd to refresh"
                             );
                         }
                     }
                 }
                 if resolved.is_empty() {
-                    tracing::debug!(
+                    tracing::warn!(
                         prefix = %d.prefix,
-                        "no resolvable next-hops for kernel install"
+                        source = r.source.as_str(),
+                        table_id = r.table_id,
+                        "no resolvable next-hops for kernel install — dropping"
                     );
                     return;
                 }

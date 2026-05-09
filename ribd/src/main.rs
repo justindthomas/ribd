@@ -209,23 +209,30 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_for_reinit = state.clone();
         let config_path_for_reinit = args.config_path.clone();
+        let ifindex_map_for_reinit = ifindex_map.clone();
         vpp_supervisor
             .on_reconnect(move |client, generation| {
                 let state = state_for_reinit.clone();
                 let config_path = config_path_for_reinit.clone();
+                let ifindex_map = ifindex_map_for_reinit.clone();
                 async move {
                     tracing::info!(
                         generation,
                         "VPP reconnected: re-pushing RIB to fresh FIB"
                     );
+                    // Refresh the shared sw_if_index → kernel
+                    // ifindex map so kernel route installs that
+                    // come in after the reconnect can resolve
+                    // their next-hop interfaces. Earlier code
+                    // built a throwaway local IfIndexMap and
+                    // dropped it on the floor — the session-side
+                    // map inside KernelBackend went stale and
+                    // every producer push for an interface
+                    // created post-startup silently bailed at
+                    // the unresolved-ifindex check.
                     {
-                        let mut m = IfIndexMap::new();
+                        let mut m = ifindex_map.lock().await;
                         m.refresh(&client).await;
-                        // The session-side IfIndexMap lives inside KernelBackend;
-                        // we can't reach it from here without restructuring.
-                        // Re-fetch sw_if_index → kernel ifindex on next SIGHUP
-                        // is the workaround for now.
-                        drop(m);
                     }
                     {
                         let mut la = state.local_addrs.lock().await;
@@ -309,6 +316,18 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(path = %config_path.display(), "SIGHUP: reloading config");
                 let cfg = ribd_config::load(&config_path);
                 let vpp = state.vpp.client().await;
+                // Refresh the sw_if_index → kernel ifindex map
+                // before any producer-driven route install runs
+                // through. Sub-interfaces / BVIs created by
+                // impd's apply between ribd startup and now
+                // would otherwise be invisible to the kernel
+                // backend, and every OSPF/BGP/static route
+                // pointing at them would silently miss the
+                // kernel FIB while still landing in VPP.
+                {
+                    let mut m = ifindex_map.lock().await;
+                    m.refresh(&vpp).await;
+                }
                 let vpp_conn = seed_connected_routes(&vpp).await;
                 let yaml_conn = build_config_connected(&vpp, &cfg).await;
                 let stat = build_config_static(&vpp, &cfg).await;

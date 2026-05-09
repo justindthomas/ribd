@@ -8,5 +8,9 @@ authors = ["Justin Thomas"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["alloc"] }
+# default-features=false drops postcard's `heapless-cas` default, which
+# transitively pulls the unmaintained `atomic-polyfill 1.0.3`
+# (RUSTSEC-2023-0089). ribd-proto only uses to_allocvec / from_bytes /
+# Error, all of which need just the `alloc` feature.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = "1"

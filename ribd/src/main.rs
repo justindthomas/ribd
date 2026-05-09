@@ -333,6 +333,44 @@ async fn main() -> anyhow::Result<()> {
                 let stat = build_config_static(&vpp, &cfg).await;
                 drop(vpp);
                 reconcile_from_config(&state, vpp_conn, yaml_conn, stat).await;
+
+                // Re-push every producer-installed route (OSPF /
+                // BGP / DHCP) through both backends. Producers are
+                // event-driven — they only push on LSA / NLRI /
+                // lease changes — so a hand-edit to router.yaml
+                // that adds a VRF master device or changes
+                // interface VRF membership would otherwise leave
+                // existing producer routes stuck in whatever
+                // kernel/VPP state they were last installed
+                // against. Mirrors the on_reconnect re-push
+                // pattern, except we hit BOTH backends here (the
+                // VPP FIB survives a SIGHUP — the on_reconnect
+                // path skips VPP because we're being called
+                // *because* VPP died).
+                let producer_deltas: Vec<ribd::rib::Delta> = {
+                    let rib = state.rib.lock().await;
+                    rib.installed_routes()
+                        .into_iter()
+                        .filter(|ir| {
+                            !matches!(
+                                ir.source,
+                                ribd_proto::Source::Connected | ribd_proto::Source::Static
+                            )
+                        })
+                        .map(|ir| ribd::rib::Delta {
+                            table_id: ir.table_id,
+                            prefix: ir.prefix,
+                            new: Some(ir),
+                        })
+                        .collect()
+                };
+                if !producer_deltas.is_empty() {
+                    state.apply_deltas(&producer_deltas).await;
+                    tracing::info!(
+                        producer_routes = producer_deltas.len(),
+                        "SIGHUP: re-pushed producer routes through backends"
+                    );
+                }
             }
         }
     }

@@ -65,7 +65,7 @@ fn is_self_route(route: &ribd_proto::Route, local: &LocalAddrs) -> bool {
 }
 
 impl SharedState {
-    async fn apply_deltas(&self, deltas: &[Delta]) {
+    pub async fn apply_deltas(&self, deltas: &[Delta]) {
         if deltas.is_empty() {
             return;
         }

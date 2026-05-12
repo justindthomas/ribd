@@ -150,21 +150,33 @@ pub struct BviDomain {
     pub vrf: Option<String>,
 }
 
-/// GRE tunnel yaml shape. VPP names these `gre<instance>`.
+/// GRE tunnel yaml shape. VPP names these `gre<instance>`. impd
+/// writes `tunnel_ip` / `tunnel_prefix` (no `_v4` suffix); accept
+/// both so a future impd schema rename doesn't quietly hide tunnel
+/// addresses from ribd's connected-build.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Tunnel {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, alias = "tunnel_ip")]
     pub tunnel_ipv4: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "tunnel_prefix")]
     pub tunnel_ipv4_prefix: Option<u8>,
     #[serde(default)]
     pub tunnel_ipv6: Option<String>,
     #[serde(default)]
     pub tunnel_ipv6_prefix: Option<u8>,
-    /// Same semantics as `Interface.vrf`.
+    /// Inner / L3 endpoint VRF (which FIB the tunnel address lives
+    /// in). Same semantics as `Interface.vrf`.
     #[serde(default)]
     pub vrf: Option<String>,
+    /// Outer / source VRF — which FIB the encapsulated GRE traffic
+    /// is forwarded through. Carried here for schema parity with
+    /// impd; ribd itself only cares about the inner VRF because
+    /// that's where the connected route for the tunnel address
+    /// lands. Storing it lets a future ribd feature surface it
+    /// without needing another schema bump.
+    #[serde(default)]
+    pub source_vrf: Option<String>,
 }
 
 impl RouterConfig {

@@ -74,10 +74,33 @@ pub struct Interface {
     pub vrf: Option<String>,
 }
 
+/// An IP address on an interface. impd writes a CIDR string today;
+/// the legacy `{address, prefix}` map is also accepted via the
+/// untagged enum so existing yaml round-trips during the schema
+/// migration. Mirrors the same pattern ospfd's `Ipv4AddressConfig`
+/// and dhcpd's `Ipv4AddressConfig` use — keeping daemon-side schemas
+/// aligned so any impd serializer shape lands cleanly across the
+/// routing stack.
 #[derive(Debug, Clone, Deserialize)]
-pub struct IpAddress {
-    pub address: String,
-    pub prefix: u8,
+#[serde(untagged)]
+pub enum IpAddress {
+    Cidr(String),
+    Split { address: String, prefix: u8 },
+}
+
+impl IpAddress {
+    /// Parse into (address, prefix). Returns None when a CIDR
+    /// variant doesn't carry a numeric prefix.
+    pub fn as_pair(&self) -> Option<(&str, u8)> {
+        match self {
+            IpAddress::Cidr(s) => {
+                let (a, p) = s.split_once('/')?;
+                let plen: u8 = p.parse().ok()?;
+                Some((a, plen))
+            }
+            IpAddress::Split { address, prefix } => Some((address.as_str(), *prefix)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -236,8 +259,9 @@ pub fn resolve_via_interface(
         match via {
             IpAddr::V4(v4) => {
                 for a in &iface.ipv4 {
-                    if let Ok(net) = format!("{}/{}", a.address, a.prefix)
-                        .parse::<ipnet::Ipv4Net>()
+                    let Some((addr, prefix)) = a.as_pair() else { continue };
+                    if let Ok(net) =
+                        format!("{}/{}", addr, prefix).parse::<ipnet::Ipv4Net>()
                     {
                         if net.contains(&v4) {
                             return Some(iface.name.clone());
@@ -247,8 +271,9 @@ pub fn resolve_via_interface(
             }
             IpAddr::V6(v6) => {
                 for a in &iface.ipv6 {
-                    if let Ok(net) = format!("{}/{}", a.address, a.prefix)
-                        .parse::<ipnet::Ipv6Net>()
+                    let Some((addr, prefix)) = a.as_pair() else { continue };
+                    if let Ok(net) =
+                        format!("{}/{}", addr, prefix).parse::<ipnet::Ipv6Net>()
                     {
                         if net.contains(&v6) {
                             return Some(iface.name.clone());
@@ -315,8 +340,10 @@ dhcp_server:
         let cfg: RouterConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.interfaces.len(), 1);
         assert_eq!(cfg.interfaces[0].name, "wan");
-        assert_eq!(cfg.interfaces[0].ipv4[0].address, "23.177.24.9");
-        assert_eq!(cfg.interfaces[0].ipv4[0].prefix, 31);
+        assert_eq!(
+            cfg.interfaces[0].ipv4[0].as_pair(),
+            Some(("23.177.24.9", 31u8)),
+        );
         assert_eq!(cfg.interfaces[0].subinterfaces.len(), 1);
         assert_eq!(cfg.routes.len(), 1);
         assert_eq!(cfg.routes[0].via, "23.177.24.8");
@@ -326,7 +353,7 @@ dhcp_server:
     fn resolve_parent_interface() {
         let ifaces = vec![Interface {
             name: "wan".into(),
-            ipv4: vec![IpAddress {
+            ipv4: vec![IpAddress::Split {
                 address: "23.177.24.9".into(),
                 prefix: 31,
             }],
@@ -388,7 +415,7 @@ routes:
     fn resolve_misses_nonmatching_subnet() {
         let ifaces = vec![Interface {
             name: "wan".into(),
-            ipv4: vec![IpAddress {
+            ipv4: vec![IpAddress::Split {
                 address: "23.177.24.9".into(),
                 prefix: 31,
             }],
@@ -398,5 +425,37 @@ routes:
         }];
         let via: std::net::IpAddr = "8.8.8.8".parse().unwrap();
         assert!(resolve_via_interface(via, &ifaces).is_none());
+    }
+
+    /// Lock in that both wire shapes deserialise — CIDR string (what
+    /// the current impd serializer emits) and split-map (the legacy
+    /// form). Either should yield the same `(addr, prefix)` pair via
+    /// `as_pair()` so downstream consumers stay schema-agnostic.
+    #[test]
+    fn ip_address_accepts_both_cidr_and_split() {
+        let yaml = r#"
+interfaces:
+- name: wan
+  ipv4:
+  - 23.177.24.9/31
+  - address: 10.0.0.1
+    prefix: 24
+  ipv6:
+  - 2602:f90e::101/127
+"#;
+        let cfg: RouterConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.interfaces[0].ipv4.len(), 2);
+        assert_eq!(
+            cfg.interfaces[0].ipv4[0].as_pair(),
+            Some(("23.177.24.9", 31u8)),
+        );
+        assert_eq!(
+            cfg.interfaces[0].ipv4[1].as_pair(),
+            Some(("10.0.0.1", 24u8)),
+        );
+        assert_eq!(
+            cfg.interfaces[0].ipv6[0].as_pair(),
+            Some(("2602:f90e::101", 127u8)),
+        );
     }
 }

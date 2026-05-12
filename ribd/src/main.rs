@@ -567,12 +567,14 @@ async fn build_config_connected(
         };
         let (v4_id, v6_id) = cfg.vrf_tables(iface.vrf.as_deref());
         for a in &iface.ipv4 {
-            if let Some(r) = build_connected_v4(&a.address, a.prefix, idx, v4_id) {
+            let Some((addr, prefix)) = a.as_pair() else { continue };
+            if let Some(r) = build_connected_v4(addr, prefix, idx, v4_id) {
                 out.push(r);
             }
         }
         for a in &iface.ipv6 {
-            if let Some(r) = build_connected_v6(&a.address, a.prefix, idx, v6_id) {
+            let Some((addr, prefix)) = a.as_pair() else { continue };
+            if let Some(r) = build_connected_v6(addr, prefix, idx, v6_id) {
                 out.push(r);
             }
         }

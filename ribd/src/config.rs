@@ -64,6 +64,14 @@ pub struct Interface {
     pub ipv6: Vec<IpAddress>,
     #[serde(default)]
     pub subinterfaces: Vec<SubInterface>,
+    /// VRF this interface is placed in. Empty / absent / "default"
+    /// means the implicit default VRF (table 0). Otherwise must
+    /// match a declared VRF name in `cfg.vrfs`; callers pull
+    /// `table_id_v4` / `table_id_v6` from there when building
+    /// Source::Connected entries so per-VRF and default-VRF
+    /// interfaces don't collide on prefix.
+    #[serde(default)]
+    pub vrf: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +91,12 @@ pub struct SubInterface {
     pub ipv6: Option<String>,
     #[serde(default)]
     pub ipv6_prefix: Option<u8>,
+    /// VRF the sub-interface lives in; same semantics as
+    /// `Interface.vrf`. A sub may sit in a different VRF from its
+    /// parent (that's the whole point of sub-interface VRFs), so we
+    /// can't just inherit.
+    #[serde(default)]
+    pub vrf: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +128,9 @@ pub struct Loopback {
     pub ipv6: Option<String>,
     #[serde(default)]
     pub ipv6_prefix: Option<u8>,
+    /// Same semantics as `Interface.vrf`.
+    #[serde(default)]
+    pub vrf: Option<String>,
 }
 
 /// BVI yaml shape. VPP names these `bvi<bridge_id>`.
@@ -128,6 +145,9 @@ pub struct BviDomain {
     pub ipv6: Option<String>,
     #[serde(default)]
     pub ipv6_prefix: Option<u8>,
+    /// Same semantics as `Interface.vrf`.
+    #[serde(default)]
+    pub vrf: Option<String>,
 }
 
 /// GRE tunnel yaml shape. VPP names these `gre<instance>`.
@@ -142,6 +162,28 @@ pub struct Tunnel {
     pub tunnel_ipv6: Option<String>,
     #[serde(default)]
     pub tunnel_ipv6_prefix: Option<u8>,
+    /// Same semantics as `Interface.vrf`.
+    #[serde(default)]
+    pub vrf: Option<String>,
+}
+
+impl RouterConfig {
+    /// Resolve a (possibly empty / "default") vrf name to its
+    /// (v4_id, v6_id) table pair. Returns `(0, 0)` for the implicit
+    /// default VRF and for any name that doesn't appear in
+    /// `cfg.vrfs` — same lenient fallback the rest of the
+    /// connected-build path uses (a typo'd VRF name shouldn't
+    /// vanish the Connected route, just keep it in default).
+    pub fn vrf_tables(&self, vrf: Option<&str>) -> (u32, u32) {
+        let name = match vrf {
+            Some(n) if !n.is_empty() && n != "default" => n,
+            _ => return (0, 0),
+        };
+        match self.vrfs.iter().find(|v| v.name == name) {
+            Some(v) => (v.table_id_v4, v.table_id_v6),
+            None => (0, 0),
+        }
+    }
 }
 
 /// Load `/persistent/config/router.yaml` (or `path`). Returns an
@@ -278,6 +320,7 @@ dhcp_server:
             }],
             ipv6: vec![],
             subinterfaces: vec![],
+            vrf: None,
         }];
         let via: std::net::IpAddr = "23.177.24.8".parse().unwrap();
         assert_eq!(resolve_via_interface(via, &ifaces).as_deref(), Some("wan"));
@@ -295,7 +338,9 @@ dhcp_server:
                 ipv4_prefix: Some(24),
                 ipv6: None,
                 ipv6_prefix: None,
+                vrf: None,
             }],
+            vrf: None,
         }];
         let via: std::net::IpAddr = "192.168.37.1".parse().unwrap();
         assert_eq!(
@@ -337,6 +382,7 @@ routes:
             }],
             ipv6: vec![],
             subinterfaces: vec![],
+            vrf: None,
         }];
         let via: std::net::IpAddr = "8.8.8.8".parse().unwrap();
         assert!(resolve_via_interface(via, &ifaces).is_none());

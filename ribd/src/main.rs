@@ -565,13 +565,14 @@ async fn build_config_connected(
             );
             continue;
         };
+        let (v4_id, v6_id) = cfg.vrf_tables(iface.vrf.as_deref());
         for a in &iface.ipv4 {
-            if let Some(r) = build_connected_v4(&a.address, a.prefix, idx) {
+            if let Some(r) = build_connected_v4(&a.address, a.prefix, idx, v4_id) {
                 out.push(r);
             }
         }
         for a in &iface.ipv6 {
-            if let Some(r) = build_connected_v6(&a.address, a.prefix, idx) {
+            if let Some(r) = build_connected_v6(&a.address, a.prefix, idx, v6_id) {
                 out.push(r);
             }
         }
@@ -584,13 +585,16 @@ async fn build_config_connected(
                 );
                 continue;
             };
+            // A sub may sit in its own VRF independent of the
+            // parent, so look up the sub's vrf, not the parent's.
+            let (sub_v4_id, sub_v6_id) = cfg.vrf_tables(sub.vrf.as_deref());
             if let (Some(addr), Some(prefix)) = (&sub.ipv4, sub.ipv4_prefix) {
-                if let Some(r) = build_connected_v4(addr, prefix, sub_idx) {
+                if let Some(r) = build_connected_v4(addr, prefix, sub_idx, sub_v4_id) {
                     out.push(r);
                 }
             }
             if let (Some(addr), Some(prefix)) = (&sub.ipv6, sub.ipv6_prefix) {
-                if let Some(r) = build_connected_v6(addr, prefix, sub_idx) {
+                if let Some(r) = build_connected_v6(addr, prefix, sub_idx, sub_v6_id) {
                     out.push(r);
                 }
             }
@@ -609,13 +613,14 @@ async fn build_config_connected(
             );
             continue;
         };
+        let (v4_id, v6_id) = cfg.vrf_tables(lo.vrf.as_deref());
         if let (Some(addr), Some(prefix)) = (&lo.ipv4, lo.ipv4_prefix) {
-            if let Some(r) = build_connected_v4(addr, prefix, idx) {
+            if let Some(r) = build_connected_v4(addr, prefix, idx, v4_id) {
                 out.push(r);
             }
         }
         if let (Some(addr), Some(prefix)) = (&lo.ipv6, lo.ipv6_prefix) {
-            if let Some(r) = build_connected_v6(addr, prefix, idx) {
+            if let Some(r) = build_connected_v6(addr, prefix, idx, v6_id) {
                 out.push(r);
             }
         }
@@ -634,13 +639,14 @@ async fn build_config_connected(
             );
             continue;
         };
+        let (v4_id, v6_id) = cfg.vrf_tables(bvi.vrf.as_deref());
         if let (Some(addr), Some(prefix)) = (&bvi.ipv4, bvi.ipv4_prefix) {
-            if let Some(r) = build_connected_v4(addr, prefix, idx) {
+            if let Some(r) = build_connected_v4(addr, prefix, idx, v4_id) {
                 out.push(r);
             }
         }
         if let (Some(addr), Some(prefix)) = (&bvi.ipv6, bvi.ipv6_prefix) {
-            if let Some(r) = build_connected_v6(addr, prefix, idx) {
+            if let Some(r) = build_connected_v6(addr, prefix, idx, v6_id) {
                 out.push(r);
             }
         }
@@ -656,13 +662,14 @@ async fn build_config_connected(
             );
             continue;
         };
+        let (v4_id, v6_id) = cfg.vrf_tables(tun.vrf.as_deref());
         if let (Some(addr), Some(prefix)) = (&tun.tunnel_ipv4, tun.tunnel_ipv4_prefix) {
-            if let Some(r) = build_connected_v4(addr, prefix, idx) {
+            if let Some(r) = build_connected_v4(addr, prefix, idx, v4_id) {
                 out.push(r);
             }
         }
         if let (Some(addr), Some(prefix)) = (&tun.tunnel_ipv6, tun.tunnel_ipv6_prefix) {
-            if let Some(r) = build_connected_v6(addr, prefix, idx) {
+            if let Some(r) = build_connected_v6(addr, prefix, idx, v6_id) {
                 out.push(r);
             }
         }
@@ -808,7 +815,12 @@ async fn build_config_static(
     out
 }
 
-fn build_connected_v4(address: &str, prefix: u8, sw_if_index: u32) -> Option<ribd_proto::Route> {
+fn build_connected_v4(
+    address: &str,
+    prefix: u8,
+    sw_if_index: u32,
+    table_id: u32,
+) -> Option<ribd_proto::Route> {
     let addr: std::net::Ipv4Addr = address.parse().ok()?;
     if prefix == 0 || prefix > 32 {
         return None;
@@ -831,11 +843,16 @@ fn build_connected_v4(address: &str, prefix: u8, sw_if_index: u32) -> Option<rib
         metric: 0,
         tag: 0,
         admin_distance: None,
-        table_id: 0,
+        table_id,
     })
 }
 
-fn build_connected_v6(address: &str, prefix: u8, sw_if_index: u32) -> Option<ribd_proto::Route> {
+fn build_connected_v6(
+    address: &str,
+    prefix: u8,
+    sw_if_index: u32,
+    table_id: u32,
+) -> Option<ribd_proto::Route> {
     let addr: std::net::Ipv6Addr = address.parse().ok()?;
     if prefix == 0 || prefix > 128 {
         return None;
@@ -856,7 +873,7 @@ fn build_connected_v6(address: &str, prefix: u8, sw_if_index: u32) -> Option<rib
         metric: 0,
         tag: 0,
         admin_distance: None,
-        table_id: 0,
+        table_id,
     })
 }
 

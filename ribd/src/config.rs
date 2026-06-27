@@ -180,14 +180,15 @@ pub struct BviDomain {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Tunnel {
     pub name: String,
-    #[serde(default, alias = "tunnel_ip")]
-    pub tunnel_ipv4: Option<String>,
-    #[serde(default, alias = "tunnel_prefix")]
-    pub tunnel_ipv4_prefix: Option<u8>,
+    /// Inner v4 address(es). ecrd writes `tunnel_ip` as a list of
+    /// `{address, prefix}` (the same untagged `IpAddress` shape interfaces
+    /// use); a bare CIDR string in the list is also accepted. `tunnel_ipv4`
+    /// is kept as a back-compat alias. ribd builds a Connected route per entry.
+    #[serde(default, alias = "tunnel_ipv4")]
+    pub tunnel_ip: Vec<IpAddress>,
+    /// Inner v6 address(es), same shape.
     #[serde(default)]
-    pub tunnel_ipv6: Option<String>,
-    #[serde(default)]
-    pub tunnel_ipv6_prefix: Option<u8>,
+    pub tunnel_ipv6: Vec<IpAddress>,
     /// Inner / L3 endpoint VRF (which FIB the tunnel address lives
     /// in). Same semantics as `Interface.vrf`.
     #[serde(default)]

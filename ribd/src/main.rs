@@ -665,14 +665,18 @@ async fn build_config_connected(
             continue;
         };
         let (v4_id, v6_id) = cfg.vrf_tables(tun.vrf.as_deref());
-        if let (Some(addr), Some(prefix)) = (&tun.tunnel_ipv4, tun.tunnel_ipv4_prefix) {
-            if let Some(r) = build_connected_v4(addr, prefix, idx, v4_id) {
-                out.push(r);
+        for ip in &tun.tunnel_ip {
+            if let Some((addr, prefix)) = ip.as_pair() {
+                if let Some(r) = build_connected_v4(addr, prefix, idx, v4_id) {
+                    out.push(r);
+                }
             }
         }
-        if let (Some(addr), Some(prefix)) = (&tun.tunnel_ipv6, tun.tunnel_ipv6_prefix) {
-            if let Some(r) = build_connected_v6(addr, prefix, idx, v6_id) {
-                out.push(r);
+        for ip in &tun.tunnel_ipv6 {
+            if let Some((addr, prefix)) = ip.as_pair() {
+                if let Some(r) = build_connected_v6(addr, prefix, idx, v6_id) {
+                    out.push(r);
+                }
             }
         }
     }

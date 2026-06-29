@@ -150,10 +150,12 @@ async fn kernel_backend_installs_and_withdraws_v4_route() {
         metric: 0,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     };
 
     // Install.
     let delta = Delta {
+        table_id: 0,
         prefix,
         new: Some(ribd_proto::InstalledRoute {
             prefix,
@@ -162,6 +164,7 @@ async fn kernel_backend_installs_and_withdraws_v4_route() {
             metric: route.metric,
             next_hops: route.next_hops.clone(),
             resolved_via: None,
+            table_id: 0,
         }),
     };
     backend.apply(&[delta.clone()]).await;
@@ -186,7 +189,7 @@ async fn kernel_backend_installs_and_withdraws_v4_route() {
     );
 
     // Withdraw.
-    let withdraw = Delta { prefix, new: None };
+    let withdraw = Delta { table_id: 0, prefix, new: None };
     backend.apply(&[withdraw]).await;
     let out2 = std::process::Command::new("ip")
         .args(["-4", "route", "show", "192.0.2.0/24"])
@@ -268,9 +271,11 @@ async fn kernel_backend_installs_ecmp_v4_route() {
             NextHop::v4(Ipv4Addr::new(10, 77, 77, 1), 102),
         ],
         resolved_via: None,
+        table_id: 0,
     };
     backend
         .apply(&[Delta {
+            table_id: 0,
             prefix,
             new: Some(installed),
         }])
@@ -304,6 +309,7 @@ async fn kernel_backend_installs_ecmp_v4_route() {
     // Withdraw.
     backend
         .apply(&[Delta {
+            table_id: 0,
             prefix,
             new: None,
         }])
@@ -375,6 +381,7 @@ async fn kernel_backend_cascade_reinstall_no_eexist() {
     let install_ospf: Vec<Delta> = prefixes
         .iter()
         .map(|prefix| Delta {
+            table_id: 0,
             prefix: *prefix,
             new: Some(ribd_proto::InstalledRoute {
                 prefix: *prefix,
@@ -383,6 +390,7 @@ async fn kernel_backend_cascade_reinstall_no_eexist() {
                 metric: 10,
                 next_hops: vec![NextHop::v4(Ipv4Addr::new(10, 99, 99, 1), 101)],
                 resolved_via: None,
+                table_id: 0,
             }),
         })
         .collect();
@@ -411,6 +419,7 @@ async fn kernel_backend_cascade_reinstall_no_eexist() {
     let install_bgp: Vec<Delta> = prefixes
         .iter()
         .map(|prefix| Delta {
+            table_id: 0,
             prefix: *prefix,
             new: Some(ribd_proto::InstalledRoute {
                 prefix: *prefix,
@@ -419,6 +428,7 @@ async fn kernel_backend_cascade_reinstall_no_eexist() {
                 metric: 0,
                 next_hops: vec![NextHop::v4(Ipv4Addr::new(10, 99, 99, 1), 101)],
                 resolved_via: None,
+                table_id: 0,
             }),
         })
         .collect();
@@ -455,6 +465,7 @@ async fn kernel_backend_cascade_reinstall_no_eexist() {
     let withdraw: Vec<Delta> = prefixes
         .iter()
         .map(|prefix| Delta {
+            table_id: 0,
             prefix: *prefix,
             new: None,
         })

@@ -177,6 +177,9 @@ async fn main() -> anyhow::Result<()> {
         vpp: vpp_supervisor.clone(),
         local_addrs,
         reconcile_generation: AtomicU64::new(0),
+        // Production: real VPP + kernel FIB path. Only tests install a
+        // recording DeltaSink here (see tests/real_session_server.rs).
+        delta_sink: None,
     });
 
     {

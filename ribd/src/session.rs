@@ -49,6 +49,31 @@ pub struct SharedState {
     /// remaining children (bgpd/ospfd/dhcpd) which query connected
     /// routes from a now-reconciled RIB.
     pub reconcile_generation: AtomicU64,
+    /// FIB-apply seam. `None` in production — [`apply_deltas`] runs the
+    /// real VPP + kernel path. Tests set `Some(sink)` to record the
+    /// deltas the server *would* program, so the real
+    /// [`handle_session`]/[`handle_message`] path can be driven over a
+    /// socket without a live dataplane. See [`DeltaSink`].
+    ///
+    /// [`apply_deltas`]: SharedState::apply_deltas
+    pub delta_sink: Option<Arc<dyn DeltaSink>>,
+}
+
+/// Test seam for the FIB-apply step.
+///
+/// Production leaves [`SharedState::delta_sink`] `None` and
+/// [`SharedState::apply_deltas`] talks to VPP + the kernel directly.
+/// A `DeltaSink` lets tests intercept the *exact* [`Delta`] stream the
+/// server produces, so the real message-handling wiring (version
+/// check, source validation, self-route filter, admin-distance
+/// arbitration, Bulk/replace) can be exercised end-to-end over a Unix
+/// socket with no dataplane.
+///
+/// The trait is deliberately synchronous: recording deltas into a
+/// buffer needs no `.await`, and keeping it sync avoids pulling in
+/// `async-trait`. Production never routes through it.
+pub trait DeltaSink: Send + Sync {
+    fn apply(&self, deltas: &[Delta]);
 }
 
 /// Returns true if `route` looks like a self-route — i.e. *every*
@@ -67,6 +92,13 @@ fn is_self_route(route: &ribd_proto::Route, local: &LocalAddrs) -> bool {
 impl SharedState {
     pub async fn apply_deltas(&self, deltas: &[Delta]) {
         if deltas.is_empty() {
+            return;
+        }
+        // Test seam: when a recording sink is installed, capture the
+        // deltas instead of programming the (absent) dataplane. Only
+        // ever `Some` in tests — see `delta_sink` / `DeltaSink`.
+        if let Some(sink) = &self.delta_sink {
+            sink.apply(deltas);
             return;
         }
         // Wait for a live VPP connection. While VPP is restarting,
